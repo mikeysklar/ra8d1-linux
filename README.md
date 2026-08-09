@@ -9,6 +9,8 @@ SiWx917 port.
 | dir | what |
 |---|---|
 | `ra8d1-cli.md` | **start here** — bring-up runbook, 3 documented gotchas, hardware/silicon/Linux findings |
+| `usage.md` | **driving the board** — how Blinka here differs from Blinka on Pi OS |
+| `BUILD.md` | building the whole stack from a stock board, plus 22 traps |
 | `ra8d1-linux/` | emulated RISC-V Linux. `rvlinux/` is the Zephyr host app, `notes/` has 7 research writeups, `ra8d-bringup.md` is the record |
 | `ra8d1-arcade/` | native Z80 + Pac-Man emulator. Z80 core passes ZEXALL cycle-exact |
 | `ra8d1-pack/` | Hermes's CircuitPython bring-up pack + `demo/acidwarp-pt.py` |

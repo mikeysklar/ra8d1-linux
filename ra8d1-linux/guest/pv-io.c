@@ -179,6 +179,25 @@ static int pv_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 			if (ret)
 				goto out;
 			pv_get(p, m->buf, m->len);
+		} else if (m->len == 0) {
+			/* A zero-length write is a presence probe: START, the
+			 * address byte, then STOP, with the ACK as the answer.
+			 * It is what SMBus quick and every i2c scanner uses,
+			 * including Blinka's I2C.scan() through PureIO.
+			 *
+			 * Route it to PV_CMD_I2C_PROBE, which the bridge has
+			 * always implemented, rather than to PV_CMD_I2C_WRITE
+			 * with a length of zero. Both reach the wire, but the
+			 * probe command says what is meant. WLEN is still
+			 * written because the host keeps it in a static that
+			 * no command clears - omitting it here would make the
+			 * bridge reuse the previous transfer's length and
+			 * emit stale bytes from the shared DATA window.
+			 */
+			writel(0, p->base + PV_I2C_WLEN);
+			ret = pv_cmd(p, PV_CMD_I2C_PROBE);
+			if (ret)
+				goto out;
 		} else {
 			pv_put(p, m->buf, m->len);
 			writel(m->len, p->base + PV_I2C_WLEN);
@@ -198,7 +217,10 @@ out:
 
 static u32 pv_i2c_func(struct i2c_adapter *adap)
 {
-	return I2C_FUNC_I2C | (I2C_FUNC_SMBUS_EMUL & ~I2C_FUNC_SMBUS_QUICK);
+	/* SMBUS_QUICK is back in the mask: it is the zero-length write, and
+	 * PV_CMD_I2C_PROBE implements it. It was masked out only while the
+	 * NO_ZERO_LEN quirk claimed the adapter could not do one. */
+	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 }
 
 static const struct i2c_algorithm pv_i2c_algo = {
@@ -214,7 +236,15 @@ static struct i2c_adapter_quirks pv_i2c_quirks = {
 	.max_read_len = 256,
 	.max_comb_1st_msg_len = 128,
 	.max_comb_2nd_msg_len = 128,
-	.flags = I2C_AQ_COMB_WRITE_THEN_READ | I2C_AQ_NO_ZERO_LEN,
+	/* No I2C_AQ_NO_ZERO_LEN: zero-length writes are supported, and are
+	 * dispatched to PV_CMD_I2C_PROBE in pv_i2c_xfer(). Declaring the quirk
+	 * made the i2c core reject every probe an address scan makes and log
+	 * one line per address, so a single Blinka I2C.scan() emitted 112
+	 * "adapter quirk: no zero length" messages and did no bus traffic at
+	 * all. The scan still returned the right answer only because the core
+	 * falls back to a one-byte read.
+	 */
+	.flags = I2C_AQ_COMB_WRITE_THEN_READ,
 };
 
 /* ------------------------------------------------------------------ gpio */
