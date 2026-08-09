@@ -14,7 +14,8 @@ over telnet. That is the configuration Adafruit Blinka needs.
 | MMU guest boots, Python + `ctypes` work | QEMU, and under the TinyEMU host harness |
 | TinyEMU machine layer boots Linux to userspace | host harness (Mac) |
 | Emulator running on real RA8D1 silicon | yes, 91 KB flash, **15.37 MIPS** |
-| Console input on real hardware | at the login prompt yes; at the shell no (trap 17) |
+| Console input on real hardware | **yes, fully — interactive shell, root caused and fixed (trap 17)** |
+| **Interactive Blinka over serial and over telnet** | **yes — `blinkatest.py` typed at the prompt** |
 | **MMU Linux booting on the board** | **yes — login prompt in 34.5 s, from OSPI flash** |
 | **Python 3.11.6 + `ctypes` on the board** | **yes** |
 | **`pv-io.c` → `/dev/i2c-0` on the board** | **yes — bridge v1, 1 i2c bus, 8 gpios, `gpiochip504`** |
@@ -22,9 +23,12 @@ over telnet. That is the configuration Adafruit Blinka needs.
 | **Blinka on the board, full auto-detection** | **yes — `chip=RA8D1_PV board=EK_RA8D1_RVLINUX`, `board.I2C()` scan returns `['0x14']`** |
 | nommu guest + telnet on real silicon | yes, working |
 
-The last three were proven 2026-08-08 on real hardware, unattended: the rootfs
-runs the whole test from `/etc/init.d/S99i2ctest` at boot and the results are
-read from the boot log, sidestepping trap 17.
+Those were first proven 2026-08-08 on real hardware, unattended: the rootfs ran
+the whole test from `/etc/init.d/S99i2ctest` at boot and the results were read
+from the boot log, sidestepping trap 17. Later the same day trap 17 was root
+caused and fixed, and the Adafruit `blinkatest.py` was run by hand at the
+prompt — over the serial console and over telnet — so the autorun script is now
+a convenience rather than the only way in.
 
 **Speed, measured on silicon:** 15.37 MIPS with Sv32 paging active, D-cache on,
 self-measured from the guest's own `instret`/`time` counters. The same loop runs
@@ -523,16 +527,49 @@ Short list. Each of these cost hours.
     place, so a config change can silently produce a byte-identical image.
     Compare sizes. Several experiments in this project looked like meaningful
     results and were no-ops.
-17. **Console input reaches the login prompt but NOT the interactive shell.**
-    Open on hardware as of this writing. Typing `root` at `buildroot login:`
-    works and you get a `#` prompt — but every command after that produces
-    nothing, not even an echo, over 60 s. Confirmed it is genuinely a login and
-    not an auto-login: reset the board and send nothing, and it stops at
-    `buildroot login:` and stays there. So the UART receive path works for
-    getty and then stops working for the shell. Until this is fixed, **do not
-    plan on driving the guest interactively over serial** — bake what you need
-    into the rootfs instead. `debugfs` can inject a script into an ext2 image
-    without a loop mount (the container has no `CAP_SYS_ADMIN`):
+17. **FIXED 2026-08-08: console input died past the login prompt. The cause was
+    polled UART receive, not the shell, not the baud rate, not the probe.**
+    The symptom: typing `root` at `buildroot login:` worked and gave a `#`
+    prompt, then every command produced nothing at all, not even an echo, and
+    the console never recovered without a reset.
+
+    The cause is arithmetic. The guest looks at the UART exactly once per
+    emulator slice — `RV_SLICE_INSNS` is 10000 instructions, ~667 us at the
+    measured 15.37 MIPS — and Zephyr's `uart_poll_in()` holds a single byte
+    between looks. At 921600 a byte arrives every ~11 us, so roughly 60 arrive
+    per slice and one survives. `root` is 4 characters and fits; a real command
+    line does not. **Losing the trailing newline leaves the guest shell blocked
+    in `read()` forever**, which is why the failure presented as dead hardware
+    rather than as corrupted input.
+
+    The fix is `CONFIG_UART_INTERRUPT_DRIVEN=y` plus an ISR that drains the
+    FIFO into a ring (`CONFIG_RVT_UART_RX_RING`, default 1024) which
+    `plat_getc()` then drains. It costs **452 bytes of flash and ~1 KB of RAM**.
+    After it, 800-character lines pasted at wire speed survive, interactive
+    `ash` works with line editing and history, and `blinkatest.py` runs typed
+    by hand.
+
+    Three plausible theories were wrong first, so do not re-run them:
+
+    | theory | how it died |
+    |---|---|
+    | busybox ash raw-mode line editing | a canonical-mode `read` loop died too |
+    | J-Link OB VCOM wedging | reopening the port did not revive it |
+    | 921600 too fast for the OB bridge | **460800 failed at the identical 40-char line** |
+
+    That last one is the useful control: halving the baud doubles the per-byte
+    time but does nothing about a 667 us gap between reads, so an unchanged
+    threshold is what proves the wire speed was never the variable.
+
+    Diagnostic note: the emulator's own 8250 model has a 64-byte receive ring
+    and counts overruns in `dropped_rx`, which **nothing ever reads or prints**.
+    An unreported drop counter is a large part of why this took a day. The
+    Zephyr-side ring exposes `plat_console_rx_dropped()` for that reason.
+
+    The workaround this trap used to recommend — bake tests into the rootfs and
+    read the boot log — is still the right move for unattended runs. `debugfs`
+    injects a script into an ext2 image without a loop mount (the container has
+    no `CAP_SYS_ADMIN`):
     ```sh
     printf "cd /etc/init.d\nwrite /path/S99mytest S99mytest\n" > cmds
     debugfs -w -f cmds rootfs.ext2
@@ -561,3 +598,34 @@ Short list. Each of these cost hours.
     missing module. QEMU-validate the full import chain before pushing — and
     `BLINKA_FORCECHIP=RA8D1_PV BLINKA_FORCEBOARD=EK_RA8D1_RVLINUX` exercises
     the board files under QEMU where the bridge does not exist.
+21. **`probe-rs reset` re-enumerates the USB CDC console, so a serial fd held
+    across a reset goes write-only.** The device node is recreated — compare
+    its mtime against when the process opened it — and the stale fd keeps
+    transmitting while receiving nothing. This reads exactly like "the guest
+    died during boot" and is not. Any tool that resets the board must close and
+    reopen the port around the reset. Note the console and the debug probe are
+    two interfaces on **one** composite USB device (SEGGER J-Link, serial
+    `001086859839`): `probe-rs` uses the debug interface, `/dev/cu.usbmodem*`
+    is the VCOM. That also means the console is a real UART, not RTT.
+22. **Blinka is slow to start because of imports, and the only cheap fix is to
+    stop re-paying them.** Measured on silicon over telnet:
+
+    | | seconds |
+    |---|---:|
+    | `python3 -c pass` (bare interpreter) | 7.34 |
+    | same with `-S` (no `site`) | 5.57 |
+    | `python3 -c 'import board'` | 30.35 |
+    | same, with `BLINKA_FORCECHIP`/`FORCEBOARD` set | 29.63 |
+    | **second `import board` in the same process** | **0.0007** |
+
+    `import board` costs 21.4 s of that, and `-X importtime` attributes it to
+    `json` (6.3 s), `re` (5.0 s), `adafruit_platformdetect` (4.9 s), `typing`
+    (3.3 s), `pathlib` (3.3 s) and `urllib.parse` (2.1 s) — pulled in largely
+    through `importlib.metadata`, not by anything I2C.
+
+    Two conclusions worth not re-deriving. **Forcing the chip and board saves
+    0.72 s, not the bulk**: it short-circuits detection *logic* while
+    `board.py` still imports the whole PlatformDetect package. And a warm
+    import is ~30,000x faster than a cold one, so the entire cost is
+    per-process. **Keep one interpreter alive** (`python3 -i script.py`, or a
+    REPL you import into once) instead of trimming Blinka's import graph.
