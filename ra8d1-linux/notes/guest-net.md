@@ -66,6 +66,39 @@ straight to `net_if`); pick whichever needs less machinery *in this app* and
 record why here. The bridge subsystem's iface requirement is why the driver
 patch exists either way.
 
+## 2026-08-09: upstream research sweep (5 parallel scans), what it changed
+
+Run while the pusher and dropbear builds were in flight. Findings that
+changed code or plans, with the noise omitted:
+
+- **Upstream Zephyr has no promiscuous support for this driver** — checked
+  against current `main`: `api_funcs` still has only init/caps/get_phy/send.
+  Our fork patch is the only implementation. (Recon only; nothing goes
+  upstream from here per the collaboration norms.)
+- **Cherry-picked upstream PR #115734** into the fork as `1b5f1c41b1d`:
+  duplicate `R_ETHER_Write()` per TX, TX `K_NO_WAIT` silently dropping under
+  backpressure, RX draining one frame per interrupt credit. All three sit in
+  the bridged-guest data path; the RX one especially — promiscuous mode turns
+  the whole segment's broadcast domain into our RX load.
+- **virtio-mmio device validation** against Linux 6.1 driver behavior:
+  `num_buffers=1` mandatory without MRG_RXBUF (we do), missing
+  `VIRTIO_NET_F_STATUS` just means the link reads permanently up (accepted),
+  and config space should tolerate 8/16/32-bit reads even though Linux reads
+  the MAC bytewise (device updated to serve all three widths).
+- **Semper S28HL512T ECC**: 16-byte internal ECC units; re-programming a unit
+  without erase is prohibited by Infineon and corrupts ECC state. This is the
+  leading suspect for the historical intermittent single-64KB verify miss,
+  relayed to the pusher implementation (its retry path must erase before any
+  rewrite) and recorded on fork issue #11. No upstream fix for the
+  PAGE_SIZE_BYTE=64 throughput hardcode either.
+- **Blinka `sysv_ipc` recon** (for the report to PT/limor's team, not for a
+  PR): the mips exclusion precedent is commit `599f21f` (Jan 2020, Onion
+  Omega, no on-target gcc — the identical situation to riscv32). But upstream
+  direction moved in PR #1114 (Jul 2026) to runtime dependency checking, so
+  the fix most likely to be accepted is a try/except runtime guard in the
+  PulseIn paths via their existing `importing.py` pattern, not another
+  platform_machine exclusion.
+
 ## Risks / open questions
 
 - Second MAC on the Mac Internet Sharing segment: §7.1 of the design says
