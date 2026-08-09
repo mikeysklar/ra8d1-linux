@@ -97,6 +97,17 @@ int plat_getc(void)
 	return n == 1 ? c : -1;
 }
 
+/* stdin on the harness is a pipe or a raw tty the OS already buffers, so
+ * there is nothing to arm and nothing gets dropped. */
+void plat_console_init(void)
+{
+}
+
+uint32_t plat_console_rx_dropped(void)
+{
+	return 0;
+}
+
 static void host_console_restore(void)
 {
 	if (termios_saved) {
@@ -186,6 +197,29 @@ int plat_pv_gpio_toggle(uint8_t pin)
 {
 	(void)pin;
 	return -ENODEV;
+}
+
+/* ------------------------------------------------------------- guest NIC */
+
+/* No network backend on the host harness: the device is never created and
+ * the guest boots exactly as it did before the NIC existed. Wiring this to a
+ * macOS utun/vmnet backend would be possible and is deliberately not done -
+ * the harness exists to test the emulator core, not to be a VM. */
+bool plat_net_mac(uint8_t mac[6])
+{
+	(void)mac;
+	return false;
+}
+
+void plat_net_send(const uint8_t *frame, uint32_t len)
+{
+	(void)frame; (void)len;
+}
+
+int plat_net_recv(uint8_t *buf, uint32_t cap)
+{
+	(void)buf; (void)cap;
+	return -1;
 }
 
 /* ---------------------------------------------------------------- system */

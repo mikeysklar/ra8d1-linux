@@ -328,6 +328,34 @@ int plat_getc(void)
 	return -1;
 }
 
+/* ------------------------------------------------------------- guest NIC
+ *
+ * The real implementation lives in src/netbridge.c. When the bridge is
+ * compiled out these stubs make plat_net_mac() return false, and the
+ * emulator then never creates the device - no MMIO window, no FDT node,
+ * a guest indistinguishable from one built before the NIC existed.
+ */
+#ifndef CONFIG_RVT_GUEST_NET
+bool plat_net_mac(uint8_t mac[6])
+{
+	ARG_UNUSED(mac);
+	return false;
+}
+
+void plat_net_send(const uint8_t *frame, uint32_t len)
+{
+	ARG_UNUSED(frame);
+	ARG_UNUSED(len);
+}
+
+int plat_net_recv(uint8_t *buf, uint32_t cap)
+{
+	ARG_UNUSED(buf);
+	ARG_UNUSED(cap);
+	return -1;
+}
+#endif /* !CONFIG_RVT_GUEST_NET */
+
 /* ------------------------------------------------------------ paravirt IO
  *
  * Same hardware and same logical pin numbering as the mini-rv32ima port, so

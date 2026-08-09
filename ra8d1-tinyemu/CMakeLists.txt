@@ -52,6 +52,14 @@ target_sources_ifdef(CONFIG_NETWORKING app PRIVATE src/telnet.c)
 # nothing else in a no-pusher build has any use for a listener.
 target_sources_ifdef(CONFIG_RVT_PUSHER app PRIVATE src/pusher.c)
 
+# The guest's NIC: the emulated device (portable, harness stubs it) and the
+# Zephyr backend that bridges it onto eth0 in promiscuous mode. The device
+# file compiles unconditionally - with no backend, plat_net_mac() returns
+# false and the device is never instantiated, same rule as the block device
+# with no rootfs.
+target_sources(app PRIVATE emu/rv_virtio_net.c)
+target_sources_ifdef(CONFIG_RVT_GUEST_NET app PRIVATE src/netbridge.c)
+
 target_include_directories(app PRIVATE src emu emu/shim)
 
 # TinyEMU build-time configuration.

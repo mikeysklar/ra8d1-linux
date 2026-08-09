@@ -73,6 +73,7 @@ typedef struct {
 	uint32_t fdt_addr;
 	uint32_t fdt_size;
 	bool has_rootfs;
+	bool has_net;
 } RVMachine;
 
 static RVMachine rvm;
@@ -914,6 +915,28 @@ int rv_machine_init(const RVBootImage *img)
 		m->has_rootfs = true;
 	}
 
+	/*
+	 * The network device, when the platform has a backend for it. The
+	 * guest's MAC comes from the platform so the Zephyr side can derive
+	 * it from the board's own address and filter promiscuous traffic by
+	 * exactly the value the guest will source frames from. Same
+	 * emit-no-node-without-a-device rule as the block device.
+	 */
+	{
+		uint8_t mac[6];
+
+		if (plat_net_mac(mac)) {
+			int ret = rv_virtio_net_init(m->mem_map,
+						     RV_VIRTIO_NET_BASE,
+						     RV_VIRTIO_NET_IRQ, mac);
+
+			if (ret != 0) {
+				return ret;
+			}
+			m->has_net = true;
+		}
+	}
+
 	m->cpu = riscv_cpu_init(m->mem_map, 32);
 	if (m->cpu == NULL) {
 		return -ENOMEM;
@@ -937,6 +960,7 @@ int rv_machine_init(const RVBootImage *img)
 	fp.initrd_start = initrd_start;
 	fp.initrd_end = initrd_end;
 	fp.has_virtio_blk = m->has_rootfs;
+	fp.has_virtio_net = m->has_net;
 
 	fdt_size = rv_build_fdt(ram + (fdt_addr - RV_RAM_BASE), (1u << 20), &fp);
 	if (fdt_size == 0) {
@@ -957,6 +981,7 @@ int rv_machine_run_bounded(uint64_t insn_limit, uint64_t us_limit)
 	while (m->stop == 0) {
 		timer_update();
 		uart_poll_input(m);
+		rv_virtio_net_poll();
 		/*
 		 * riscv_cpu_interp() returns early on a WFI, so a guest that
 		 * idles spins here rather than blocking. That is the same

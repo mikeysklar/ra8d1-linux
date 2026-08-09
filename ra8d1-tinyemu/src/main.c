@@ -37,6 +37,7 @@
 #include "rv_machine.h"
 #include "rv_platform.h"
 #include "rv_virtio.h"
+#include "netbridge.h"
 #include "telnet.h"
 #include "testrom.h"
 
@@ -197,6 +198,9 @@ int main(void)
 	 */
 	rvt_net_bringup();
 	rvt_telnet_start();
+	/* Promiscuous RX on, filter thread up, before the guest boots - its
+	 * first DHCP DISCOVER should find a wire already listening. */
+	rvt_netbridge_start();
 
 	/*
 	 * The image loader, on its own port. Started here rather than after the

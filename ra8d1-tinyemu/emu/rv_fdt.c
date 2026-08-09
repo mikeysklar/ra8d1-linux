@@ -330,6 +330,18 @@ size_t rv_build_fdt(uint8_t *buf, size_t buf_size, const RVFdtParams *p)
 		fdt_end_node(s);
 	}
 
+	/* Second slot: the network device. Same no-node-without-a-device rule
+	 * as above; the MAC itself travels in the device's config space
+	 * (VIRTIO_NET_F_MAC), not the devicetree. */
+	if (p->has_virtio_net) {
+		fdt_begin_node_num(s, "virtio", RV_VIRTIO_NET_BASE);
+		fdt_prop_str(s, "compatible", "virtio,mmio");
+		fdt_prop_reg64(s, RV_VIRTIO_NET_BASE, RV_VIRTIO_NET_SIZE);
+		fdt_prop_u32(s, "interrupt-parent", plic_phandle);
+		fdt_prop_u32(s, "interrupts", RV_VIRTIO_NET_IRQ);
+		fdt_end_node(s);
+	}
+
 	/*
 	 * Poweroff and reboot, through the generic syscon bindings. This is
 	 * the same 0x5555 / 0x7777 protocol mini-rv32ima used, so a guest

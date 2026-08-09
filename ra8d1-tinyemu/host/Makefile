@@ -15,7 +15,7 @@ CFLAGS  += -DMAX_XLEN=32 -DCONFIG_RISCV_MAX_XLEN=32 -DFLEN=$(FLEN)
 CFLAGS  += -DUSE_GLOBAL_STATE -DCONFIG_HOST_SBI
 
 EMU_SRC = ../emu/riscv_cpu.c ../emu/rv_iomem.c ../emu/rv_hostsbi.c \
-          ../emu/rv_fdt.c ../emu/rv_machine.c ../emu/rv_virtio.c
+          ../emu/rv_fdt.c ../emu/rv_machine.c ../emu/rv_virtio.c ../emu/rv_virtio_net.c
 ifneq ($(FLEN),0)
 EMU_SRC += ../emu/softfp.c
 endif

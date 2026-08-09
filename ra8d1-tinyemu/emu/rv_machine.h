@@ -36,6 +36,11 @@
 #define RV_PVIO_SIZE   0x00001000u
 #define RV_VIRTIO_BASE 0x10001000u
 #define RV_VIRTIO_SIZE 0x00001000u
+/* Second virtio-mmio slot, the network device. QEMU's virt machine places
+ * its slots 0x1000 apart at 0x10001000+, so the guest kernel - a virt build -
+ * finds this arrangement familiar. */
+#define RV_VIRTIO_NET_BASE 0x10002000u
+#define RV_VIRTIO_NET_SIZE 0x00001000u
 #define RV_PLIC_BASE   0x40100000u
 #define RV_PLIC_SIZE   0x00400000u
 #define RV_RAM_BASE    0x80000000u
@@ -43,6 +48,7 @@
 /* PLIC sources. Source 0 does not exist. */
 #define RV_UART_IRQ    1
 #define RV_VIRTIO_IRQ  2
+#define RV_VIRTIO_NET_IRQ 3
 
 /* ------------------------------------------------------------------- boot */
 

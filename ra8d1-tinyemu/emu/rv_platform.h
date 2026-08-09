@@ -99,6 +99,25 @@ void plat_console_init(void);
  * 17 look like dead hardware instead of lost input. */
 uint32_t plat_console_rx_dropped(void);
 
+/* ------------------------------------------------------------- guest NIC
+ *
+ * Backend for the virtio-net device in rv_virtio_net.c. A platform with no
+ * network implements these as: mac -> false, and the device is then never
+ * created (no MMIO window, no FDT node, guest sees nothing).
+ */
+
+/* The MAC the guest should use. Returns false when there is no network
+ * backend, which disables the device entirely. */
+bool plat_net_mac(uint8_t mac[6]);
+
+/* Transmit one ethernet frame from the guest. Never blocks the emulator for
+ * long; a frame that cannot be queued is dropped, as on a real wire. */
+void plat_net_send(const uint8_t *frame, uint32_t len);
+
+/* Next received frame for the guest, or -1 if none. Non-blocking. `cap` is
+ * the buffer size; frames longer than cap are dropped by the platform. */
+int plat_net_recv(uint8_t *buf, uint32_t cap);
+
 /* --------------------------------------------------------- paravirtual I/O
  *
  * Real board I2C and GPIO, reached by the guest through the MMIO bridge at

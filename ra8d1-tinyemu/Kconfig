@@ -325,4 +325,52 @@ config RVT_NET_FALLBACK_NETMASK
 
 endmenu
 
+menu "Guest network interface"
+
+config RVT_GUEST_NET
+	bool "Give the guest a virtio-net NIC bridged to the real Ethernet"
+	default y
+	depends on NETWORKING && NET_L2_ETHERNET
+	select NET_PROMISCUOUS_MODE
+	select NET_SOCKETS_PACKET
+	help
+	  A virtio-net device in the emulated machine, backed by eth0 in
+	  promiscuous mode: the guest gets its own MAC (the board's with the
+	  local bit set and the last byte inverted) and its own DHCP lease on
+	  the segment, so ssh/scp reach it directly. src/netbridge.c filters
+	  the segment's traffic for the guest MAC, broadcast and multicast.
+
+	  NET_PROMISCUOUS_MODE needs driver support - eth_renesas_ra.c gained
+	  .set_config in the zephyr fork (8ca5eb88530); without that commit
+	  this option prints "promiscuous mode REFUSED" and the guest NIC is
+	  deaf. NET_SOCKETS_PACKET is what makes ethernet L2 transmit the
+	  guest's raw frames verbatim (ethernet.c "Raw packet, just send it").
+
+if RVT_GUEST_NET
+
+config RVT_NET_GUEST_RX_RING
+	int "Wire-to-guest frame ring, bytes (power of two)"
+	default 8192
+	help
+	  Holds length-prefixed whole frames between the promiscuous RX
+	  thread and the emulator's once-per-slice poll. Five full-size
+	  frames; a burst beyond that is dropped and counted, which is what a
+	  real NIC with a full ring does too.
+
+config RVT_NET_GUEST_THREAD_PRIORITY
+	int "Filter thread priority"
+	default 6
+	help
+	  Below telnet (5), above the emulator (10): a flood of segment
+	  traffic must not starve the console, but filtering must still
+	  preempt the guest or the ring only drains at slice boundaries.
+
+config RVT_NET_GUEST_THREAD_STACK
+	int "Filter thread stack size"
+	default 2048
+
+endif # RVT_GUEST_NET
+
+endmenu
+
 source "Kconfig.zephyr"

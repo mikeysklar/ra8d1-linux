@@ -51,4 +51,26 @@ uint64_t rv_virtio_blk_sectors(void);
 /* Requests completed, for the console statistics line. */
 uint32_t rv_virtio_blk_requests(void);
 
+/* ------------------------------------------------------------------ net
+ *
+ * Sibling network device in rv_virtio_net.c, same idiom and the same
+ * deliberate limits (modern MMIO, split rings, no indirect descriptors) plus
+ * its own: two queues, no offloads, VIRTIO_NET_F_MAC as the only feature.
+ * Backend is plat_net_send()/plat_net_recv() in rv_platform.h.
+ */
+
+/* Attach the network device. `mac` is the address the guest will see in
+ * config space and source frames from; the platform chose it, so the
+ * platform can filter for it. */
+int rv_virtio_net_init(PhysMemoryMap *mem_map, uint64_t base, int irq,
+		       const uint8_t mac[6]);
+
+/* Pull received frames from the platform into the guest's RX ring. Called
+ * once per emulator slice, like uart_poll_input(); bounded per call. Safe to
+ * call when the device was never initialised. */
+void rv_virtio_net_poll(void);
+
+/* TX frame count; RX delivered and RX dropped through the out-params. */
+uint32_t rv_virtio_net_stats(uint32_t *rx, uint32_t *dropped);
+
 #endif /* RV_VIRTIO_H_ */

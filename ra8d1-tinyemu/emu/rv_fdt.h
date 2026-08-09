@@ -30,6 +30,7 @@ typedef struct {
 	uint32_t initrd_start;  /* both 0 for no initrd */
 	uint32_t initrd_end;
 	bool has_virtio_blk;    /* emit the virtio-mmio node */
+	bool has_virtio_net;    /* emit the second virtio-mmio node (net) */
 } RVFdtParams;
 
 /*
