@@ -890,6 +890,14 @@ static int nl_push(int s)
 	}
 
 	if (nl_send_banner(s) != 0) {
+		/* Seen on hardware: the connection right after an aborted
+		 * multi-MB push can fail here while the dead connection's
+		 * buffers are still tearing down, and without this line the
+		 * console says "connection from X" and then nothing - the
+		 * host sees an empty read and cannot tell a dead pusher from
+		 * a busy one. */
+		us("pusher: banner send failed; likely transient buffer "
+		   "exhaustion, connect again\r\n");
 		return -1;
 	}
 	if (nl_recv_exact(s, hdr, sizeof(hdr)) != 0) {
