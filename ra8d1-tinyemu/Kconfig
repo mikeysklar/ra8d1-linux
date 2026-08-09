@@ -132,6 +132,152 @@ endif # RVT_TELNET
 
 endmenu
 
+menu "TCP image pusher"
+
+config RVT_PUSHER
+	bool "Serve the RA8LDR image loader over TCP"
+	default y
+	depends on NETWORKING && NET_SOCKETS && NET_TCP && NET_IPV4 && FLASH
+	select REBOOT
+	help
+	  Accept guest images on a TCP port, in the same wire format the
+	  rvlinux app on this board already serves, so
+	  ra8d1-linux/rvlinux/tools/pushimage.py drives this build unchanged.
+	  Without it the only way to replace a guest image is to flash the
+	  other application, push, and flash back - BUILD.md gotcha 14, which
+	  costs a working board every time someone forgets that the two apps
+	  boot different kernels.
+
+	  REBOOT is selected rather than assumed: unlike rvlinux, a push here
+	  stops the guest (see src/pusher.c) and the board has to restart to
+	  bring it back.
+
+if RVT_PUSHER
+
+config RVT_PUSHER_PORT
+	int "TCP port"
+	default 5555
+	help
+	  pushimage.py's default. Changing it means passing HOST:PORT to the
+	  tool, which it supports.
+
+config RVT_PUSHER_REBOOT_DELAY_S
+	int "Seconds after a successful push before the board reboots"
+	default 30
+	help
+	  A push stops the guest, so the board has to reboot for the new image
+	  to run. It is deferred rather than immediate because the normal
+	  operation is two pushes back to back - kernel, then rootfs - and
+	  rebooting between them would boot a new kernel against the old
+	  rootfs and make the operator wait out DHCP before the second push.
+	  Any connection arriving inside the window pushes the deadline out
+	  again, so the board restarts once the pushing stops.
+
+	  0 disables the automatic reboot entirely; the board then sits with a
+	  stopped guest until it is reset.
+
+config RVT_PUSHER_HALT_MS
+	int "Milliseconds to wait for the emulator to stop before refusing"
+	default 5000
+	help
+	  rv_request_poweroff() takes effect at the next instruction-slice
+	  boundary, which is ~667 us at the measured 15.37 MIPS, so this is
+	  three orders of magnitude of headroom. It is a bound rather than a
+	  wait because the alternative to timing out is erasing flash while
+	  the guest is still reading it.
+
+config RVT_PUSHER_BLANK_CHECK
+	bool "Verify a slot really is blank after erasing it"
+	default y
+	help
+	  NOR erase reports success on a status bit and nothing checks that the
+	  bits actually went to 1. A program can only clear bits, so writing
+	  over an incompletely erased block yields the bitwise AND of old and
+	  new: data that is present, stable across reads, and wrong - and
+	  indistinguishable from a bad write once the payload is on top of it.
+	  Checking before the first payload byte separates the two faults, at
+	  the cost of one read pass over the erased region.
+
+config RVT_PUSHER_VERIFY_ATTEMPTS
+	int "How many times to read back and CRC a slot before failing a push"
+	default 3
+	help
+	  A CRC32 that matches is worth trusting however many attempts it took,
+	  so if any pass agrees the payload is right and the earlier passes were
+	  bad reads. The count is the real product: pushes that routinely need a
+	  second pass mean reads are marginal, which is a much more specific
+	  finding than "verify failed".
+
+	  Read attempts only. Nothing is rewritten between them and nothing may
+	  be - this is Semper NOR with ECC over 16-byte units, and programming a
+	  unit twice without an erase between corrupts it. A push that exhausts
+	  its attempts fails, and pushimage.py's retry erases the slot first.
+
+config RVT_PUSHER_RX_TIMEOUT_S
+	int "Seconds a stalled transfer is tolerated before the push is dropped"
+	default 30
+
+config RVT_PUSHER_STALL_MS
+	int "Milliseconds to wait for the flash writer before declaring a stall"
+	default 15000
+	help
+	  A buffer should come back in ~35 ms. Seconds means the flash operation
+	  is not returning at all, which FSP can do - several of its register
+	  waits are unbounded spins. The listener stops draining the socket
+	  while it waits here, so an unbounded wait shows up on the host as a
+	  mid-transfer stall with a silent, healthy-looking board.
+
+config RVT_PUSHER_BUF
+	int "Size of each of the two receive buffers, bytes"
+	default 8192
+	help
+	  The socket fills one while the flash programs the other. Bigger
+	  buffers mean longer aligned flash writes; two of these live in .bss
+	  for the life of the application.
+
+	  Must be a multiple of 16, and src/pusher.c BUILD_ASSERTs it: this part
+	  computes ECC over 16-byte units and forbids programming one twice
+	  without an erase between, so a buffer that did not end on a unit
+	  boundary would have every write reprogram the unit the previous write
+	  left half done.
+
+config RVT_PUSHER_THREAD_PRIORITY
+	int "Listener thread priority"
+	default 7
+	help
+	  Between the telnet thread (5) and the emulator (10), and both bounds
+	  matter.
+
+	  Above the emulator because the banner and header exchange happen
+	  while the guest is still running - the guest is only stopped once the
+	  header validates - and the emulator loop never blocks or yields, so a
+	  pusher at or below 10 would never be scheduled to read the header
+	  that is going to stop it.
+
+	  Below telnet because an attached console is interactive and a push is
+	  not: the pusher spends minutes at a time inside flash operations, and
+	  the console's 5 ms poll should keep winning through it.
+
+config RVT_PUSHER_WRITER_PRIORITY
+	int "Flash writer thread priority"
+	default 8
+	help
+	  One below the listener, so draining the socket beats programming
+	  flash when both are runnable. That is the right way round: the flash
+	  is the slower end and TCP is what stalls if it is not read.
+
+config RVT_PUSHER_THREAD_STACK
+	int "Listener thread stack size"
+	default 3072
+
+config RVT_PUSHER_WRITER_STACK
+	int "Flash writer thread stack size"
+	default 2048
+
+endif # RVT_PUSHER
+
+endmenu
+
 menu "Networking bring-up"
 	depends on NETWORKING
 

@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "rv_platform.h"
+#include "pusher.h"
 #include "telnet.h"
 
 /* ------------------------------------------------------------- guest RAM */
@@ -88,6 +89,83 @@ const uint8_t *plat_slot_base(int slot, size_t *size)
 	}
 	*size = slots[slot].size;
 	return (const uint8_t *)(OSPI_MMAP_BASE + slots[slot].off);
+}
+
+/* --------------------------------------------------------- flash writing
+ *
+ * Reading a slot needs nothing but the window above. Erasing and programming
+ * one needs the driver, and the driver works in offsets rather than pointers,
+ * so the image pusher asks for these three facts and stays free of board
+ * knowledge. See src/pusher.h for the declarations.
+ */
+
+/* Uniform erase granularity of the S28HL512T, and the size of the part. Stated
+ * rather than read back from the driver's page layout because it is what the
+ * host tool's timing model assumes too - pushimage.py's ERASE_BLOCK - and a
+ * disagreement between the two would surface as a wrong progress estimate long
+ * before it surfaced as a fault. */
+#define OSPI_ERASE_SZ 	  (256U * 1024U)
+#define OSPI_SIZE     	  (64U * 1024U * 1024U)
+
+/*
+ * The last erase block of the chip is never handed to a push.
+ *
+ * Zephyr's flash_erase() asks the page layout for the page at `offset + len`,
+ * and flash_get_page_info() returns -EINVAL one past the final page, so an
+ * erase ending exactly at the top of the chip fails outright. rvlinux reserves
+ * a block for this reason and its rootfs slot stops short of the top.
+ *
+ * This app's devicetree does not: rvl_rootfs_partition runs to 0x4000000
+ * because the partition is only ever *read* through the memory-mapped window,
+ * and reads do not care. So the reserve has to be applied here instead of
+ * inherited from DT, and that is why plat_slot_offset() reports a writable
+ * size that is 256 KB smaller than DT_REG_SIZE for the rootfs. Without it the
+ * banner would advertise a capacity the erase cannot reach, and a full-size
+ * rootfs push would die on its last block after twelve minutes.
+ */
+#define OSPI_WRITABLE_END (OSPI_SIZE - OSPI_ERASE_SZ)
+
+BUILD_ASSERT(DT_REG_ADDR(KERNEL_PART) % OSPI_ERASE_SZ == 0,
+	     "slots must start on an erase block, or a push erases its neighbour");
+BUILD_ASSERT(DT_REG_SIZE(KERNEL_PART) % OSPI_ERASE_SZ == 0,
+	     "slots must be a whole number of erase blocks");
+BUILD_ASSERT(DT_SAME_NODE(DT_MTD_FROM_FIXED_PARTITION(KERNEL_PART),
+			  DT_MTD_FROM_FIXED_PARTITION(ROOTFS_PART)),
+	     "both slots must live in the same flash device");
+
+static const struct device *const nor =
+	DEVICE_DT_GET(DT_MTD_FROM_FIXED_PARTITION(KERNEL_PART));
+
+const struct device *plat_flash_dev(void)
+{
+	return nor;
+}
+
+uint32_t plat_slot_offset(int slot, uint32_t *writable)
+{
+	uint32_t off, end;
+
+	if (slot < 0 || slot >= PLAT_SLOT_COUNT) {
+		if (writable != NULL) {
+			*writable = 0;
+		}
+		return UINT32_MAX;
+	}
+
+	off = slots[slot].off;
+	end = off + slots[slot].size;
+	if (end > OSPI_WRITABLE_END) {
+		end = OSPI_WRITABLE_END;
+	}
+	if (writable != NULL) {
+		*writable = end > off ? end - off : 0;
+	}
+	return off;
+}
+
+uint32_t plat_flash_erase_size(void)
+{
+	return OSPI_ERASE_SZ;
 }
 
 /* ------------------------------------------------------------------ time */

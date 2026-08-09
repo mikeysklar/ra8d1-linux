@@ -31,6 +31,8 @@
 
 #include <string.h>
 
+#include "image.h"
+#include "pusher.h"
 #include "rv_hostsbi.h"
 #include "rv_machine.h"
 #include "rv_platform.h"
@@ -38,23 +40,9 @@
 #include "telnet.h"
 #include "testrom.h"
 
-/* ------------------------------------------------------------ image format
- *
- * Not ours. This is the layout the rvlinux app on this board already writes
- * and its TCP pusher already tests end to end: a 16-byte header at the slot
- * base and the payload from +4096. Keeping it byte-for-byte means an image
- * pushed with the working tool boots here unchanged, and it is why this port
- * has no image container and no loader of its own.
- */
-#define IMG_HDR_SIZE    16U
-#define IMG_PAYLOAD_OFF 4096U
-
-struct img_hdr {
-	char     magic[8];
-	uint32_t len;
-	uint32_t crc;
-};
-
+/* The on-flash image container lives in src/image.h, because src/pusher.c
+ * writes what this file reads and the two must agree byte for byte - it is the
+ * header the host tool parses. */
 BUILD_ASSERT(sizeof(struct img_hdr) == IMG_HDR_SIZE,
 	     "header must match what the rvlinux pusher writes");
 
@@ -81,11 +69,6 @@ BUILD_ASSERT(sizeof(struct img_hdr) == IMG_HDR_SIZE,
  * the first boot on real silicon did exactly that.
  */
 #define RV_IMAGE_MMODE_TEXT_OFFSET 0
-
-static const char *const slot_magic[PLAT_SLOT_COUNT] = {
-	[PLAT_SLOT_KERNEL] = "RA8LINUX",
-	[PLAT_SLOT_ROOTFS] = "RA8ROOTF",
-};
 
 /* ------------------------------------------------------------------ output
  *
@@ -163,7 +146,7 @@ static const uint8_t *slot_check(int slot, uint32_t *len, uint32_t *ms,
 		return NULL;
 	}
 	h = (const struct img_hdr *)base;
-	if (memcmp(h->magic, slot_magic[slot], 8) != 0) {
+	if (memcmp(h->magic, img_slot_magic(slot), 8) != 0) {
 		return NULL;
 	}
 	if (h->len == 0 || h->len > slot_size - IMG_PAYLOAD_OFF) {
@@ -214,6 +197,14 @@ int main(void)
 	 */
 	rvt_net_bringup();
 	rvt_telnet_start();
+
+	/*
+	 * The image loader, on its own port. Started here rather than after the
+	 * slot checks so that a board holding an image it cannot boot is still
+	 * reachable to be re-imaged - which is the case where a pusher is worth
+	 * the most. It waits for an address of its own accord.
+	 */
+	rvt_pusher_start();
 
 	/*
 	 * Everything from here on either CRCs megabytes out of the OSPI window
@@ -334,6 +325,13 @@ int main(void)
 		us("rv_machine_init failed: errno ");
 		udec((uint32_t)(-ret));
 		us("\r\n");
+		/*
+		 * No guest will ever run, so tell the pusher the board is
+		 * already quiescent. Without this a push would wait out its
+		 * halt timeout and refuse - on exactly the board that most
+		 * needs a new image.
+		 */
+		(void)rvt_pusher_guest_halted();
 		return 0;
 	}
 
@@ -360,13 +358,23 @@ int main(void)
 	ret = rv_machine_run();
 	insns = rv_machine_insns();
 
-	us("\r\n--- guest stopped (");
-	us(ret == 1 ? "reboot" : "poweroff");
-	us(") ---\r\n");
-	if (ret == 1) {
-		plat_reboot();
+	/*
+	 * Whatever stopped the guest, tell the pusher: it may be blocked
+	 * waiting for exactly this, because the rootfs is read in place out of
+	 * the flash a push has to erase. It answers true when the stop was its
+	 * doing, which is not a poweroff and should not be reported as one.
+	 */
+	if (rvt_pusher_guest_halted()) {
+		us("\r\n--- guest halted for an image push ---\r\n");
 	} else {
-		plat_poweroff();
+		us("\r\n--- guest stopped (");
+		us(ret == 1 ? "reboot" : "poweroff");
+		us(") ---\r\n");
+		if (ret == 1) {
+			plat_reboot();
+		} else {
+			plat_poweroff();
+		}
 	}
 
 	riscv_host_sbi_stats(&sbi_calls, &sbi_unsupported);

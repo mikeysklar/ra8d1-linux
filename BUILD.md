@@ -534,13 +534,18 @@ Short list. Each of these cost hours.
     absence is correct, not a broken build — do not chase it.
 14. **The two Zephyr apps are not interchangeable, and mixing them gives you a
     board that looks dead but is fine.** `rvlinux` runs a nommu guest (M-mode
-    kernel, `text_offset=0`) and serves telnet plus the TCP pusher. The TinyEMU
-    app runs an MMU guest (S-mode, `text_offset=0x400000`) and has no
-    networking at all. Flashing one while the kernel slot holds the other's
-    image gives: no telnet, no ping, and a console that explains itself only if
-    you are reading at the right baud. Swap the app and the kernel together.
-    Keep a copy of the working ELF before flashing anything — recovery is then
-    a 20 second reflash instead of a rebuild.
+    kernel, `text_offset=0`); the TinyEMU app runs an MMU guest (S-mode,
+    `text_offset=0x400000`). Flashing one while the kernel slot holds the
+    other's image gives a console that explains itself only if you are reading
+    at the right baud. Swap the app and the kernel together. Keep a copy of
+    the working ELF before flashing anything — recovery is then a 20 second
+    reflash instead of a rebuild.
+
+    (Historical note: this trap used to be worse because only rvlinux had
+    telnet and the TCP pusher, so the wrong app also meant "no telnet, no
+    ping, no way to push". As of 2026-08-08/09 the TinyEMU app has both — the
+    telnet console and an RA8LDR pusher that stops the guest, pushes, and
+    reboots — so the apps differ mainly in which guest they boot.)
 15. **The emulator is more forgiving than the hardware, so test drivers against
     hardware semantics.** TinyEMU's `target_read_slow()` returns 0 for reads
     outside any registered range. Real RISC-V raises a load access fault. A

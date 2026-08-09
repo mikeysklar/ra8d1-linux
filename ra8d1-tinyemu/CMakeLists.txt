@@ -44,6 +44,14 @@ target_sources(app PRIVATE
 # main.c and platform_zephyr.c free of #ifdefs.
 target_sources_ifdef(CONFIG_NETWORKING app PRIVATE src/telnet.c)
 
+# The TCP image loader, speaking the protocol rvlinux's pushimage.py already
+# tests. Same arrangement: src/pusher.h stubs its interface to inline no-ops
+# when it is off, so main.c has no #ifdefs. Unlike telnet.c this one is guarded
+# on its own symbol rather than on CONFIG_NETWORKING, because the flash
+# accessors it needs from platform_zephyr.c are compiled unconditionally and
+# nothing else in a no-pusher build has any use for a listener.
+target_sources_ifdef(CONFIG_RVT_PUSHER app PRIVATE src/pusher.c)
+
 target_include_directories(app PRIVATE src emu emu/shim)
 
 # TinyEMU build-time configuration.
