@@ -15,6 +15,7 @@ over telnet. That is the configuration Adafruit Blinka needs.
 | TinyEMU machine layer boots Linux to userspace | host harness (Mac) |
 | Emulator running on real RA8D1 silicon | yes, 91 KB flash, **15.37 MIPS** |
 | Console input on real hardware | **yes, fully — interactive shell, root caused and fixed (trap 17)** |
+| **`pip install` on the board, offline** | **yes — 4 CircuitPython drivers from a local wheelhouse** |
 | **Interactive Blinka over serial and over telnet** | **yes — `blinkatest.py` typed at the prompt** |
 | **MMU Linux booting on the board** | **yes — login prompt in 34.5 s, from OSPI flash** |
 | **Python 3.11.6 + `ctypes` on the board** | **yes** |
@@ -54,8 +55,20 @@ Docker container.
 | Buildroot (guest) | `https://gitlab.com/buildroot.org/buildroot.git` | `--depth 1` is fine |
 | TinyEMU (emulator core) | `https://bellard.org/tinyemu/tinyemu-2019-12-21.tar.gz` | MIT |
 
-The RA8D1 work itself (`ra8d1-linux/`, `ra8d1-tinyemu/`, `ra8d1-arcade/`) is
-**not** a git repo — it is local files only. Back it up separately.
+The RA8D1 work itself (`ra8d1-linux/`, `ra8d1-tinyemu/`, `ra8d1-arcade/`) lives
+at **`git@github.com:mikeysklar/ra8d1-linux.git`**. Build output, guest images
+and the `cnlohr/mini-rv32ima` checkout are excluded by `.gitignore` — this file
+is what regenerates them.
+
+**Where the kernel is actually built, which the repo does not show.** `pv-io.c`
+is versioned here as a standalone driver, but the shipped kernel builds it
+**in-tree**: the file is copied to
+`linux-6.1.44/drivers/i2c/busses/pv-io.c` in the trimmed tree (`/br/mmu-trim`
+in the container) and built with
+`make ARCH=riscv CROSS_COMPILE=riscv32-linux- Image`, toolchain on `PATH` from
+`/br/mmu/host/bin`. There is also an out-of-tree `obj-m` skeleton at
+`/br/mmu-pv/` used during bring-up; it produces a `.ko` nobody loads, since the
+driver must be built in to probe before `/sbin/init`.
 
 ### Patches and modified files
 
@@ -85,13 +98,25 @@ never-compiled driver accumulates these silently:
 2. Probe uses `copy_from_kernel_nofault()` instead of a bare `readl()`. On
    RISC-V a load from an unassigned physical address **faults**; it does not read
    zero. As a `device_initcall` that was an oops during boot.
-3. `I2C_AQ_NO_ZERO_LEN` added to `pv_i2c_quirks` — it must go in the static
-   initialiser, because `i2c_adapter.quirks` is `const`.
-4. `I2C_FUNC_SMBUS_QUICK` masked out of the functionality bits, so the driver
-   stops advertising a capability the quirk now refuses.
+3. ~~`I2C_AQ_NO_ZERO_LEN` added to `pv_i2c_quirks`~~ — **superseded 2026-08-08,
+   see below.**
+4. ~~`I2C_FUNC_SMBUS_QUICK` masked out of the functionality bits~~ —
+   **superseded with it.**
 
-Fixes 3 and 4 together stop `i2c.scan()` reporting all 112 addresses as present.
-Note they are necessary but **not sufficient** — see trap 10.
+Fixes 3 and 4 were the first working answer to `i2c.scan()` reporting all 112
+addresses as present, but they were a workaround: the quirk made the i2c core
+*reject* every zero-length write a scan issues, logging
+`adapter quirk: no zero length` once per address — 112 lines per scan — and the
+correct result came back only because the core then fell back to a one-byte
+read. No probe reached the wire.
+
+**Both are now reverted.** `pv_i2c_xfer()` dispatches a zero-length write to
+`PV_CMD_I2C_PROBE`, which the host bridge always implemented and nothing ever
+called, and `SMBUS_QUICK` is advertised again. Verified on hardware: the 112 log
+lines are gone and the scan still returns exactly `['0x14']` with no false
+positives, which is the failure mode trap 10 warns about. `PV_I2C_WLEN` is still
+written on the probe path — the host keeps it in a register the guest owns and
+no command clears, so skipping it would reuse the previous transfer's length.
 
 ### Known-broken upstream drivers (filed, not fixed)
 
@@ -629,3 +654,29 @@ Short list. Each of these cost hours.
     import is ~30,000x faster than a cold one, so the entire cost is
     per-process. **Keep one interpreter alive** (`python3 -i script.py`, or a
     REPL you import into once) instead of trimming Blinka's import graph.
+23. **pip on the target needs three stdlib packages Buildroot trims, and pip
+    hides which one is missing.** `http` (vendored urllib3), `xmlrpc` (vendored
+    distlib) and `distutils`. The `xmlrpc` failure is the expensive one to
+    diagnose: pip 26 eagerly imports
+    `pip._internal.operations.install.wheel`, and on failure records it in
+    `_MISSING_MODULES` and re-raises from an audit hook later, so the reported
+    error is `No module named 'pip._internal.operations.install.wheel'` and the
+    real cause appears nowhere. Get the true traceback with
+    `python3 -c "import pip._internal.operations.install.wheel"`. Cheapest fix
+    is to sync every entry `output/target/usr/lib/python3.11/` has that the
+    rootfs lacks, rather than chasing one module per cycle — this cost four
+    QEMU rounds, and would have cost four 20-minute push cycles on hardware.
+
+    pip and setuptools themselves need **no Buildroot rebuild**: they are pure
+    Python, so unpacking their wheels into `site-packages` works. And
+    `ensurepip` *does* ship its bundled wheels despite `--without-ensurepip` in
+    `python3.mk`, so `python3 -m venv` works — verify against the target, not
+    the makefile.
+24. **A wheelhouse built on a Mac hides `sysv_ipc`.** `adafruit-blinka` requires
+    it only under `sys_platform == "linux"`, so `pip download` on darwin never
+    asks for it and every wheel passes a pure-Python check. On the guest the
+    marker flips true and installs fail with `No matching distribution found for
+    sysv_ipc` — no riscv32 wheel has ever been published. Install drivers with
+    `--no-deps`, naming the CircuitPython dependencies explicitly; Blinka is
+    already in the image. A clean wheelhouse build is not evidence that
+    on-target resolution works.

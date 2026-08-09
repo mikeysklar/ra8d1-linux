@@ -64,40 +64,56 @@ itself and PlatformDetect reads it, so stock examples run unmodified.
 
 ## 3. Installing libraries
 
-On Pi OS you make a venv and `pip install`. Here, as shipped, **there is no
-`pip`, no `venv`, no `ensurepip`, and no network.** What works instead:
+`pip` works, and so does `venv`. What does not exist is **the network**, so
+every install is offline, out of the wheelhouse baked into the image at
+`/opt/wheels`. All of the below is verified on hardware.
+
+**`--no-deps` is mandatory, and this is the big one.**
+
+```sh
+pip3 install --user --no-index --find-links=/opt/wheels --no-deps \
+    adafruit-circuitpython-bme280 adafruit-circuitpython-busdevice \
+    adafruit-circuitpython-register adafruit-circuitpython-typing
+```
+
+Name the CircuitPython dependencies yourself. Without `--no-deps`, pip resolves
+the driver's dependency on `adafruit-blinka`, which requires `sysv_ipc` on
+Linux — a C extension with no riscv32 wheel in existence:
+
+```
+ERROR: Could not find a version that satisfies the requirement sysv_ipc>=1.1.0;
+       sys_platform == "linux" and platform_machine != "mips" (from adafruit-blinka)
+```
+
+Blinka is already installed in the image, so there is nothing to gain by
+letting pip resolve it and everything to lose. On a Pi this never comes up
+because `sysv_ipc` has wheels there.
 
 **Pure-Python only.** Most `adafruit-circuitpython-*` drivers qualify. Anything
-with a C extension needs a riscv32 wheel — essentially none exist, and there is
-no compiler on the guest. This is not a packaging problem you can work around.
+with a C extension needs a riscv32 wheel — essentially none exist, and the
+guest has no compiler. Not a packaging problem you can work around.
 
-**With the packaging build flashed** (`configs/mmu_pip_fragment` plus a
-wheelhouse at `/opt/wheels`):
+**`PYTHONUSERBASE` is preset to `/tmp/py`** in `/etc/profile`, because the
+default `~/.local` is on the read-only root and every `--user` install would
+fail there.
 
-```sh
-export PYTHONUSERBASE=/opt/py
-pip install --user --no-index --find-links=/opt/wheels adafruit-circuitpython-bme280
-```
-
-`PYTHONUSERBASE` is the PEP 370 user site; Python puts it on `sys.path` with no
-further setup. It is used here rather than a venv because Buildroot builds
-CPython `--without-ensurepip`, so plain `python3 -m venv` cannot bootstrap pip.
-
-**If you do use a venv, `--system-site-packages` is mandatory:**
+**venv works**, including pip inside it — `ensurepip` ships its bundled pip and
+setuptools wheels, despite `--without-ensurepip` appearing in Buildroot's
+`python3.mk`. Use `--system-site-packages`:
 
 ```sh
-python3 -m venv --system-site-packages --without-pip /opt/env
+python3 -m venv --system-site-packages /tmp/env
 ```
 
-Blinka, PlatformDetect and PureIO live in the read-only system
-`site-packages`. A plain venv hides them, and you cannot reinstall them — no
-network, and `adafruit-blinka` does not build on riscv32. Omitting that flag
-gives you an environment where `import board` fails and cannot be repaired.
+That flag is **mandatory**, not stylistic. Blinka, PlatformDetect and PureIO
+live in the read-only system `site-packages`; a plain venv hides them and you
+cannot reinstall them, because of the `sysv_ipc` wall above. Omit it and you
+get an environment where `import board` fails and cannot be repaired.
 
 **Nothing persists.** The root filesystem is read-only and `/tmp` is tmpfs, so
 anything installed at runtime is gone on reset. For a library you want to keep,
-put it in the rootfs image and push it. Persistent on-board installs need
-writable storage, which is not built yet.
+add it to the wheelhouse and rebuild the image. Persistent on-board installs
+need writable storage, which is not built yet.
 
 ## 4. What the hardware actually gives you
 
