@@ -100,6 +100,25 @@ every requirement is asserted and then re-read from the resulting `.config`:
 | `FPU` | the userspace is ilp32d hard float |
 | `MODULES` | `guest-runtime` builds `pv-io.c` as a module |
 | `BLK_DEV_INITRD` | cheap, and a fallback boot path |
+| `VIRTIO_NET` | added 2026-08-09 for ssh; see below |
+
+## `VIRTIO_NET` added, 2026-08-09
+
+The trim originally dropped `VIRTIO_NET` on the grounds that the machine has no
+network device. It is back, because `08-guest-net-mmu.md` settles on virtio-net
+as the guest transport and dropbear needs an address to bind (`notes/ssh.md`).
+
+| | Image |
+|---|---:|
+| trim as shipped 2026-08-08 | 6,543,840 |
+| + `CONFIG_VIRTIO_NET=y` | **6,577,272** |
+| delta | **+33,432 B** |
+
+Still 1.73 MB under the 8 MB slot. `olddefconfig` changed nothing else -
+`NET_FAILOVER` and `DIMLIB`, which `VIRTIO_NET` selects, were already `y`, and
+`PACKET`/`INET`/`IP_PNP_DHCP` were never trimmed. Booted under QEMU with
+`-device virtio-net-device`: `eth0` binds `virtio_net`, `udhcpc` takes the
+10.0.2.15 lease, ping to the gateway is 1.2-2.0 ms.
 
 ## Reproducing
 
