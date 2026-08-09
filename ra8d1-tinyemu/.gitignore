@@ -1,0 +1,8 @@
+build/
+.cache/
+__pycache__/
+host/tinyemu-host
+host/tinyemu-host.dSYM/
+host/tests/smoke.bin
+host/tests/smoke.elf
+*.o

@@ -1,0 +1,276 @@
+# Application options for the emulated RISC-V Linux host app.
+#
+# Zephyr uses this file as the Kconfig root when it exists in the application
+# directory, so it must pull in the tree's own Kconfig at the end.
+
+mainmenu "rv32ima Linux on EK-RA8D1"
+
+config RVL_EMU_PRIORITY
+	int "Priority of the thread running the emulator step loop"
+	default 10
+	depends on NETWORKING
+	help
+	  The step loop never blocks and never yields, so with Zephyr's
+	  priority-based preemption any thread numerically above it would
+	  never run. The Renesas Ethernet RX thread sits at priority 2 and the
+	  networking timers at 0, so main() lowers itself to this value before
+	  entering the loop. Guest instructions then run only in the time the
+	  network stack does not want, which is nearly all of it.
+
+config RVL_LOADER_PROMPT_MS
+	int "Milliseconds to wait for the loader key at boot"
+	default 2000
+	help
+	  Before checking the stored image, main() prints a prompt and watches
+	  the console UART for 'L' for this long. Pressing it runs the image
+	  loader even when the image already in OSPI is perfectly valid, which
+	  is otherwise unreachable: the loader only runs when img_check()
+	  fails, so replacing a good image would mean corrupting it first.
+
+	  Timing out proceeds to the normal boot, and bytes other than 'L' are
+	  ignored rather than ending the wait, so the board cannot be stranded
+	  at the prompt by a missed key or by a terminal that says hello when
+	  it opens the port. Set to 0 to remove the prompt entirely.
+
+config RVL_BLANK_CHECK
+	bool "Verify a slot really is blank after erasing it"
+	default y
+	help
+	  The flash driver reports erase success from a status bit and never
+	  confirms the bits reached 1. This reads the erased region back and
+	  fails the push if anything is not 0xFF.
+
+	  It exists because a NOR program can only clear bits, so programming
+	  over an incompletely erased block produces the bitwise AND of old and
+	  new: data that is present, reads back identically every time, and is
+	  wrong. After the payload is written that is indistinguishable from a
+	  bad write. Checking before any payload byte is written tells the two
+	  apart, which is the one thing the post-hoc diagnostic cannot do.
+
+	  Costs one read pass over the erased region, a few seconds at rootfs
+	  sizes, against pushes that already take minutes.
+
+config RVL_VERIFY_ATTEMPTS
+	int "How many times to read back and CRC a slot before failing a push"
+	default 3
+	help
+	  A CRC32 that matches is trustworthy however many attempts it took, so
+	  if any pass agrees the payload is good and an earlier disagreeing
+	  pass was a bad read rather than bad data. Set to 1 to restore the
+	  old single-pass behaviour.
+
+	  The attempt count is reported whenever it exceeds one, which is the
+	  point: pushes that routinely need a second pass mean reads off the
+	  OSPI are marginal, and that is worth knowing precisely.
+
+	  This only protects the loader. If reads are marginal then
+	  guest_prepare()'s memcpy out of the same window at boot has the same
+	  exposure and this does nothing for it.
+
+config RVL_KERNEL_SLOT_KB
+	int "Size of the kernel image slot in OSPI, KB"
+	default 8192
+	help
+	  OSPI is split into a kernel slot at 0x40000 and a rootfs slot
+	  immediately above it, each with its own header, magic and CRC. This
+	  sets the boundary; the rootfs slot takes everything left up to the
+	  last erase block.
+
+	  Must be a whole number of 256 KB erase blocks so the two slots never
+	  share one -- that separation is what stops a rootfs push from being
+	  able to damage the kernel. The default 8 MB holds a gzipped kernel
+	  with room to spare and leaves 55.5 MB for the rootfs. A raw,
+	  zero-padded kernel needs this raised to at least 26 MB, which costs
+	  the rootfs the same amount.
+
+menu "Image push over TCP"
+	depends on NETWORKING
+
+config RVL_NETLOAD
+	bool "Serve the image loader over TCP"
+	default y
+	depends on NET_SOCKETS && NET_TCP && NET_IPV4
+	help
+	  Runs the image receiver as a thread alongside the telnet console,
+	  always listening, instead of only during the boot-time window the
+	  UART loader occupies. The network stack does not exist that early,
+	  so a TCP loader could not live there in any case.
+
+	  The workflow becomes: leave the board running, push a new image into
+	  the slot the guest is not using, reset when you are ready. A push
+	  that fails leaves the running system untouched.
+
+	  The UART loader stays available and is the recovery path when the
+	  network does not come up.
+
+if RVL_NETLOAD
+
+config RVL_NETLOAD_PORT
+	int "TCP port"
+	default 5555
+
+config RVL_NETLOAD_RX_TIMEOUT_S
+	int "Seconds a stalled transfer is tolerated before the push is dropped"
+	default 30
+	help
+	  Once the payload is streaming the slot has already been erased, so a
+	  host that vanishes without closing its socket would otherwise leave
+	  this thread blocked forever with the old image gone. On timeout the
+	  push is abandoned and the service goes back to listening, so the
+	  recovery is to run the push again rather than to reset the board.
+
+config RVL_NETLOAD_STALL_MS
+	int "Milliseconds to wait for the flash writer before declaring a stall"
+	default 15000
+	help
+	  A receive buffer should come back from the writer in about 35 ms
+	  (8 KB programmed 64 bytes at a time). Waiting seconds means the flash
+	  operation has not returned, which FSP can do: several of its register
+	  waits are unbounded spins.
+
+	  This exists because the listener stops draining the socket while it
+	  waits, so a stuck writer closes the TCP window and the host's send()
+	  blocks partway through a transfer that was going fine. That looked,
+	  from the host, like a mid-stream stall on a healthy board, and
+	  produced no console output whatsoever.
+
+config RVL_NETLOAD_BUF
+	int "Size of each of the two receive buffers, bytes"
+	default 8192
+	help
+	  The socket fills one buffer while the flash programs the other. Two
+	  of these are allocated statically. Larger buys little: flash
+	  programming is several times slower than the link, so the buffers
+	  spend most of a push full and waiting.
+
+config RVL_NETLOAD_THREAD_PRIORITY
+	int "Listener thread priority"
+	default 5
+	help
+	  Must outrank the emulator loop at RVL_EMU_PRIORITY, which never
+	  blocks and never yields, or the loader would never be scheduled.
+
+config RVL_NETLOAD_WRITER_PRIORITY
+	int "Flash writer thread priority"
+	default 6
+	help
+	  Below the listener so the socket is always drained in preference to
+	  programming, above the emulator for the reason above. The FSP status
+	  poll busy-waits, so the guest does make very little progress during a
+	  push; that is accepted, since the point of a push is to reset after.
+
+config RVL_NETLOAD_THREAD_STACK
+	int "Listener thread stack size"
+	default 3072
+
+config RVL_NETLOAD_WRITER_STACK
+	int "Flash writer thread stack size"
+	default 2048
+
+endif # RVL_NETLOAD
+
+endmenu
+
+menu "Guest telnet console"
+
+config RVL_TELNET
+	bool "Serve the guest console over TCP"
+	default y
+	depends on NETWORKING && NET_SOCKETS && NET_TCP && NET_IPV4
+	help
+	  The guest's emulated 8250 has both ends inside this app: the store
+	  hook is its TX and the load hook is its RX. This option adds a TCP
+	  listener that takes over both ends while a client is attached, so a
+	  plain `telnet <board-ip>` lands on the guest's root shell.
+
+	  With no client attached the console falls back to the physical UART,
+	  which is how the board is debugged.
+
+if RVL_TELNET
+
+config RVL_TELNET_PORT
+	int "TCP port"
+	default 23
+
+config RVL_TELNET_TX_RING
+	int "Guest-to-client buffer, bytes (power of two)"
+	default 8192
+	help
+	  Sized to absorb a kernel boot log burst without dropping. The
+	  emulator never blocks on this ring; once it is full, further guest
+	  output is discarded and counted.
+
+config RVL_TELNET_RX_RING
+	int "Client-to-guest buffer, bytes (power of two)"
+	default 1024
+
+config RVL_TELNET_MIRROR_UART
+	bool "Also copy guest output to the UART while a client is attached"
+	default n
+	help
+	  Handy when debugging the bridge itself. Costs one uart_poll_out()
+	  per guest character on the emulator's hot path, which at 921600 baud
+	  is about 11 us of busy-wait per byte, so leave it off normally.
+
+config RVL_TELNET_THREAD_PRIORITY
+	int "Telnet thread priority"
+	default 5
+
+config RVL_TELNET_THREAD_STACK
+	int "Telnet thread stack size"
+	default 4096
+
+endif # RVL_TELNET
+
+endmenu
+
+menu "Networking bring-up"
+	depends on NETWORKING
+
+config RVL_NET_STATIC_IP
+	bool "Configure a static IPv4 address instead of using DHCP"
+	default n
+
+config RVL_NET_ADDR
+	string "Static IPv4 address"
+	default "192.168.1.50"
+	depends on RVL_NET_STATIC_IP
+	help
+	  Used as the interface address. DHCP is not started.
+
+config RVL_NET_NETMASK
+	string "Static IPv4 netmask"
+	default "255.255.255.0"
+	depends on RVL_NET_STATIC_IP
+
+config RVL_NET_GATEWAY
+	string "Static IPv4 gateway"
+	default "192.168.1.1"
+	depends on RVL_NET_STATIC_IP
+
+config RVL_NET_DHCP_WAIT_S
+	int "Seconds to wait for DHCP before booting the guest"
+	default 15
+	depends on !RVL_NET_STATIC_IP
+	help
+	  Boot is held here only so the address can be printed on the console
+	  before the guest's own output starts. On timeout the guest boots
+	  anyway and DHCP keeps running in the background; the address is
+	  printed whenever it does arrive.
+
+config RVL_NET_FALLBACK_ADDR
+	string "Static IPv4 address to apply if DHCP times out"
+	default ""
+	depends on !RVL_NET_STATIC_IP
+	help
+	  Leave empty to disable. DHCP is left running, so a lease arriving
+	  later still takes effect.
+
+config RVL_NET_FALLBACK_NETMASK
+	string "Netmask for the DHCP fallback address"
+	default "255.255.255.0"
+	depends on !RVL_NET_STATIC_IP
+
+endmenu
+
+source "Kconfig.zephyr"

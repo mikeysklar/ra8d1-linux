@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Guest-side driver for the EK-RA8D1 paravirtual I/O bridge.
+ *
+ * The host (Zephyr, ports/zephyr-cp -- see ra8d1-linux/rvlinux/src/main.c)
+ * exposes a small register block at physical 0x11200000 that forwards I2C and
+ * GPIO operations to the board's real Renesas peripherals. This driver wraps
+ * that block in the two standard Linux interfaces:
+ *
+ *   /dev/i2c-0      via an i2c_adapter        <- this is what Blinka needs
+ *   /dev/gpiochip0  via a gpio_chip
+ *
+ * Build it INTO the kernel. The stock cnlohr rv32-nommu image has
+ * CONFIG_MODULES=n (verified: no /proc/modules, no /lib/modules, no
+ * /proc/kallsyms), so there is nothing to insmod into. Add to the Buildroot
+ * kernel fragment:
+ *
+ *   CONFIG_I2C=y
+ *   CONFIG_I2C_CHARDEV=y
+ *   CONFIG_GPIOLIB=y
+ *   CONFIG_GPIO_CDEV=y
+ *
+ * and drop this file in as drivers/i2c/busses/i2c-ra8d1-pv.c (or anywhere with
+ * an unconditional obj-y entry).
+ *
+ * ALL REGISTER ACCESSES ARE 32-BIT. The emulator's store hook is not given the
+ * access width, so a byte store is indistinguishable from a word store; the
+ * host side therefore only ever honours full words. Do not use memcpy_toio()
+ * or any byte-wise helper on the DATA window -- pack into words explicitly, as
+ * pv_put()/pv_get() below do.
+ *
+ * NOT YET TESTED ON HARDWARE. The host side has a self-test that passes
+ * host-side; this half has never been compiled or run. Treat it as a starting
+ * point, not as known-good.
+ */
+
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/io.h>
+#include <linux/slab.h>
+#include <linux/i2c.h>
+#include <linux/gpio/driver.h>
+#include <linux/errno.h>
+#include <linux/uaccess.h>
+
+#define PV_PHYS            0x11200000UL
+#define PV_LEN             0x1000
+
+#define PV_ID              0x000
+#define PV_VERSION         0x004
+#define PV_CAPS            0x008
+#define PV_CMD             0x00c
+#define PV_STATUS          0x010
+#define PV_RESULT          0x014
+#define PV_I2C_BUS         0x018
+#define PV_I2C_ADDR        0x01c
+#define PV_I2C_WLEN        0x020
+#define PV_I2C_RLEN        0x024
+#define PV_GPIO_PIN        0x028
+#define PV_GPIO_VAL        0x02c
+#define PV_GPIO_FLAGS      0x030
+#define PV_DATA            0x200
+
+#define PV_ID_MAGIC        0x50564930U   /* 'PVI0' */
+
+#define PV_CMD_NOP             0x00
+#define PV_CMD_I2C_WRITE       0x01
+#define PV_CMD_I2C_READ        0x02
+#define PV_CMD_I2C_WRITE_READ  0x03
+#define PV_CMD_I2C_PROBE       0x04
+#define PV_CMD_GPIO_CONFIG     0x10
+#define PV_CMD_GPIO_SET        0x11
+#define PV_CMD_GPIO_GET        0x12
+#define PV_CMD_GPIO_TOGGLE     0x13
+
+#define PV_GPIO_F_INPUT        BIT(0)
+#define PV_GPIO_F_OUTPUT       BIT(1)
+#define PV_GPIO_F_PULL_UP      BIT(2)
+#define PV_GPIO_F_PULL_DOWN    BIT(3)
+#define PV_GPIO_F_OPEN_DRAIN   BIT(4)
+#define PV_GPIO_F_INIT_HIGH    BIT(5)
+#define PV_GPIO_F_INIT_LOW     BIT(6)
+
+struct pv_io {
+	void __iomem *base;
+	struct i2c_adapter adap;
+	struct gpio_chip gc;
+	struct mutex lock;   /* serialises the single shared register block */
+	unsigned int data_bytes;
+};
+
+static struct pv_io *pv;
+
+/* Pack a byte buffer into the word-wide DATA window. */
+static void pv_put(struct pv_io *p, const u8 *src, unsigned int len)
+{
+	unsigned int i;
+
+	for (i = 0; i < len; i += 4) {
+		u32 w = 0;
+		unsigned int j;
+
+		for (j = 0; j < 4 && i + j < len; j++)
+			w |= (u32)src[i + j] << (8 * j);
+
+		writel(w, p->base + PV_DATA + i);
+	}
+}
+
+static void pv_get(struct pv_io *p, u8 *dst, unsigned int len)
+{
+	unsigned int i;
+
+	for (i = 0; i < len; i += 4) {
+		u32 w = readl(p->base + PV_DATA + i);
+		unsigned int j;
+
+		for (j = 0; j < 4 && i + j < len; j++)
+			dst[i + j] = (w >> (8 * j)) & 0xff;
+	}
+}
+
+/* Fire a command and return the host's errno. The store to CMD does not
+ * return until the host has finished the real bus transaction, so STATUS is
+ * valid immediately -- there is no busy bit and nothing to poll. */
+static int pv_cmd(struct pv_io *p, u32 cmd)
+{
+	writel(cmd, p->base + PV_CMD);
+	return (s32)readl(p->base + PV_STATUS);
+}
+
+/* ------------------------------------------------------------------- i2c */
+
+static int pv_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
+{
+	struct pv_io *p = i2c_get_adapdata(adap);
+	int i = 0, done = 0, ret = 0;
+
+	mutex_lock(&p->lock);
+	writel(0, p->base + PV_I2C_BUS);
+
+	while (i < num) {
+		struct i2c_msg *m = &msgs[i];
+		struct i2c_msg *n = (i + 1 < num) ? &msgs[i + 1] : NULL;
+
+		if (m->flags & I2C_M_TEN) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		if (m->len > p->data_bytes) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+
+		writel(m->addr, p->base + PV_I2C_ADDR);
+
+		/* The classic register read: write then repeated-START read.
+		 * Collapse it into one host command so the bridge issues a
+		 * genuine repeated START rather than STOP/START, which many
+		 * I2C devices require. */
+		if (!(m->flags & I2C_M_RD) && n && (n->flags & I2C_M_RD) &&
+		    n->addr == m->addr && n->len <= p->data_bytes &&
+		    m->len + n->len <= p->data_bytes) {
+			pv_put(p, m->buf, m->len);
+			writel(m->len, p->base + PV_I2C_WLEN);
+			writel(n->len, p->base + PV_I2C_RLEN);
+			ret = pv_cmd(p, PV_CMD_I2C_WRITE_READ);
+			if (ret)
+				goto out;
+			pv_get(p, n->buf, n->len);
+			i += 2;
+			done += 2;
+			continue;
+		}
+
+		if (m->flags & I2C_M_RD) {
+			writel(m->len, p->base + PV_I2C_RLEN);
+			ret = pv_cmd(p, PV_CMD_I2C_READ);
+			if (ret)
+				goto out;
+			pv_get(p, m->buf, m->len);
+		} else {
+			pv_put(p, m->buf, m->len);
+			writel(m->len, p->base + PV_I2C_WLEN);
+			ret = pv_cmd(p, PV_CMD_I2C_WRITE);
+			if (ret)
+				goto out;
+		}
+
+		i++;
+		done++;
+	}
+
+out:
+	mutex_unlock(&p->lock);
+	return ret ? ret : done;
+}
+
+static u32 pv_i2c_func(struct i2c_adapter *adap)
+{
+	return I2C_FUNC_I2C | (I2C_FUNC_SMBUS_EMUL & ~I2C_FUNC_SMBUS_QUICK);
+}
+
+static const struct i2c_algorithm pv_i2c_algo = {
+	.master_xfer = pv_i2c_xfer,
+	.functionality = pv_i2c_func,
+};
+
+/* The DATA window is 256 bytes and a write+read pair shares it. Declaring the
+ * limits here makes the i2c core split or reject oversized transfers instead
+ * of letting them fail deep in the bridge. */
+static struct i2c_adapter_quirks pv_i2c_quirks = {
+	.max_write_len = 256,
+	.max_read_len = 256,
+	.max_comb_1st_msg_len = 128,
+	.max_comb_2nd_msg_len = 128,
+	.flags = I2C_AQ_COMB_WRITE_THEN_READ | I2C_AQ_NO_ZERO_LEN,
+};
+
+/* ------------------------------------------------------------------ gpio */
+
+static int pv_gpio_get(struct gpio_chip *gc, unsigned int off)
+{
+	struct pv_io *p = gpiochip_get_data(gc);
+	int ret;
+
+	mutex_lock(&p->lock);
+	writel(off, p->base + PV_GPIO_PIN);
+	ret = pv_cmd(p, PV_CMD_GPIO_GET);
+	if (!ret)
+		ret = readl(p->base + PV_GPIO_VAL) ? 1 : 0;
+	mutex_unlock(&p->lock);
+
+	return ret;
+}
+
+static void pv_gpio_set(struct gpio_chip *gc, unsigned int off, int val)
+{
+	struct pv_io *p = gpiochip_get_data(gc);
+
+	mutex_lock(&p->lock);
+	writel(off, p->base + PV_GPIO_PIN);
+	writel(val ? 1 : 0, p->base + PV_GPIO_VAL);
+	pv_cmd(p, PV_CMD_GPIO_SET);
+	mutex_unlock(&p->lock);
+}
+
+static int pv_gpio_dir_in(struct gpio_chip *gc, unsigned int off)
+{
+	struct pv_io *p = gpiochip_get_data(gc);
+	int ret;
+
+	mutex_lock(&p->lock);
+	writel(off, p->base + PV_GPIO_PIN);
+	writel(PV_GPIO_F_INPUT, p->base + PV_GPIO_FLAGS);
+	ret = pv_cmd(p, PV_CMD_GPIO_CONFIG);
+	mutex_unlock(&p->lock);
+
+	return ret;
+}
+
+static int pv_gpio_dir_out(struct gpio_chip *gc, unsigned int off, int val)
+{
+	struct pv_io *p = gpiochip_get_data(gc);
+	int ret;
+
+	mutex_lock(&p->lock);
+	writel(off, p->base + PV_GPIO_PIN);
+	writel(PV_GPIO_F_OUTPUT |
+	       (val ? PV_GPIO_F_INIT_HIGH : PV_GPIO_F_INIT_LOW),
+	       p->base + PV_GPIO_FLAGS);
+	ret = pv_cmd(p, PV_CMD_GPIO_CONFIG);
+	mutex_unlock(&p->lock);
+
+	return ret;
+}
+
+/* ------------------------------------------------------------------ init */
+
+static int __init pv_io_init(void)
+{
+	u32 id, caps;
+	int ret;
+
+	pv = kzalloc(sizeof(*pv), GFP_KERNEL);
+	if (!pv)
+		return -ENOMEM;
+
+	/* On nommu this is an identity mapping, but go through ioremap() so
+	 * the same source works if the guest ever gains an MMU. */
+	pv->base = ioremap(PV_PHYS, PV_LEN);
+	if (!pv->base) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
+	/* Probe with copy_from_kernel_nofault(), NOT a bare readl().
+	 *
+	 * On RISC-V a load from an unassigned physical address raises a load
+	 * access fault (scause 5); it does NOT read back zero. The plain
+	 * readl() this used to do therefore oopsed on any machine without the
+	 * bridge -- and as a device_initcall that is an oops during boot, not
+	 * merely a failed insmod. copy_from_kernel_nofault() plants an
+	 * exception-table fixup, which riscv do_trap_error() consults via
+	 * fixup_exception(), so we get -EFAULT instead of a dead kernel.
+	 * Verified on qemu-system-riscv32 -M virt, which has nothing mapped
+	 * at 0x11200000.
+	 */
+	if (copy_from_kernel_nofault(&id,
+				     (const void __force *)(pv->base + PV_ID),
+				     sizeof(id))) {
+		pr_info("ra8d1-pv: no bridge at %#lx (probe faulted), skipping\n",
+			PV_PHYS);
+		ret = -ENODEV;
+		goto err_unmap;
+	}
+	if (id != PV_ID_MAGIC) {
+		pr_info("ra8d1-pv: no bridge at %#lx (id %#x), skipping\n",
+			PV_PHYS, id);
+		ret = -ENODEV;
+		goto err_unmap;
+	}
+
+	caps = readl(pv->base + PV_CAPS);
+	pv->data_bytes = caps >> 16;
+	mutex_init(&pv->lock);
+
+	pr_info("ra8d1-pv: bridge v%u, %u i2c bus(es), %u gpio(s), %u B window\n",
+		readl(pv->base + PV_VERSION), caps & 0xff, (caps >> 8) & 0xff,
+		pv->data_bytes);
+
+	if (caps & 0xff) {
+		pv->adap.owner = THIS_MODULE;
+		pv->adap.algo = &pv_i2c_algo;
+		pv->adap.quirks = &pv_i2c_quirks;
+		pv->adap.nr = 0;
+		strscpy(pv->adap.name, "EK-RA8D1 paravirt I2C",
+			sizeof(pv->adap.name));
+		i2c_set_adapdata(&pv->adap, pv);
+
+		ret = i2c_add_numbered_adapter(&pv->adap);
+		if (ret) {
+			pr_err("ra8d1-pv: i2c_add_adapter failed: %d\n", ret);
+			goto err_unmap;
+		}
+	}
+
+	if ((caps >> 8) & 0xff) {
+		pv->gc.label = "ra8d1-pv";
+		pv->gc.parent = NULL;
+		pv->gc.owner = THIS_MODULE;
+		pv->gc.base = -1;
+		pv->gc.ngpio = (caps >> 8) & 0xff;
+		pv->gc.can_sleep = true;   /* host call blocks */
+		pv->gc.get = pv_gpio_get;
+		pv->gc.set = pv_gpio_set;
+		pv->gc.direction_input = pv_gpio_dir_in;
+		pv->gc.direction_output = pv_gpio_dir_out;
+
+		ret = gpiochip_add_data(&pv->gc, pv);
+		if (ret)
+			pr_err("ra8d1-pv: gpiochip_add_data failed: %d\n", ret);
+	}
+
+	return 0;
+
+err_unmap:
+	iounmap(pv->base);
+err_free:
+	kfree(pv);
+	pv = NULL;
+	return ret;
+}
+
+/* Late enough that the i2c and gpio cores are up, early enough that anything
+ * hanging off the bus can still probe normally. */
+device_initcall(pv_io_init);
+
+#ifdef MODULE
+static void __exit pv_io_exit(void)
+{
+	if (!pv)
+		return;
+	if (pv->gc.ngpio)
+		gpiochip_remove(&pv->gc);
+	if (pv->adap.algo)
+		i2c_del_adapter(&pv->adap);
+	iounmap(pv->base);
+	kfree(pv);
+	pv = NULL;
+}
+module_exit(pv_io_exit);
+#endif
+
+MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("EK-RA8D1 paravirtual I2C/GPIO bridge");

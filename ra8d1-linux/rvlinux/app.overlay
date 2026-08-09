@@ -1,0 +1,24 @@
+/* Console at 921600 instead of 115200: image pushes go from ~377 s to ~38 s.
+ * The J-Link OB VCOM handles this rate; Renesas' own Sens-Wear board runs its
+ * console here. Measured 9,216 B/s at 115200 = 80% of line rate, so the baud
+ * really is the ceiling, not USB or the probe. */
+&uart9 {
+	current-speed = <921600>;
+};
+
+/* iic1 is the RIIC controller on P512 (SCL) / P511 (SDA). The board DTS wires
+ * up its pinctrl but leaves it disabled, because on this board those pins are
+ * the MIPI graphics expansion header (J58) and the DVP camera connector (J13)
+ * and only a shield normally drives them. The paravirt I/O bridge exposes it
+ * to the emulated guest, so turn it on the same way the Renesas LCD shield
+ * overlays do. 100 kHz rather than the board's Fast Mode Plus default: with
+ * flying leads and whatever pull-ups the attached device brings, slow is the
+ * setting that works. */
+&iic1 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	clock-frequency = <DT_FREQ_K(100)>;
+	pinctrl-0 = <&iic1_default>;
+	pinctrl-names = "default";
+};

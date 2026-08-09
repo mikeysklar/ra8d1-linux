@@ -1,0 +1,12 @@
+build/
+host/test_z80
+host/test_pacman
+host/bench
+host/*.o
+host/*.ppm
+# Generated, never committed. mktestrom.py rebuilds it; real ROM images are
+# yours and must not end up in the repo.
+host/testrom.bin
+*.bin
+.cache/
+__pycache__/

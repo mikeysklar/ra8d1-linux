@@ -1,0 +1,182 @@
+# Application options.
+#
+# Zephyr uses this file as the Kconfig root when it exists in the application
+# directory, so it must pull in the tree's own Kconfig at the end.
+
+mainmenu "TinyEMU rv32 Sv32 Linux on EK-RA8D1"
+
+config RVT_CMDLINE
+	string "Guest kernel command line"
+	default "console=ttyS0,115200 earlycon=sbi root=/dev/vda ro rootfstype=ext2"
+	help
+	  Placed in the generated devicetree as /chosen/bootargs.
+
+	  The default assumes the rootfs slot holds an ext2 image, which is
+	  what Buildroot produces and what the guest kernel can mount - it has
+	  ext2 and ext4 built in and, checked against the image, no EROFS and
+	  no squashfs. `ro` is not optional: the block device offers
+	  VIRTIO_BLK_F_RO and rejects writes.
+
+	  earlycon=sbi gets output from the very first line, before the 8250
+	  driver exists, through the SBI debug console in emu/rv_hostsbi.c.
+
+config RVT_FORCE_SELFTEST
+	bool "Always run the built-in RV32 self-test"
+	default n
+	help
+	  Ignore the kernel slot and boot src/testrom.h regardless of what is
+	  in flash. The self-test is otherwise only reached when the slot holds
+	  nothing bootable.
+
+	  This is how the emulator gets characterised on a board whose flash
+	  holds a guest it cannot boot, which is the normal state until a
+	  kernel small enough for the 8 MB slot exists.
+
+config RVT_CRC_ROOTFS
+	bool "Verify the rootfs CRC at boot"
+	default n
+	help
+	  The kernel slot is always verified: a half-written kernel otherwise
+	  surfaces as a crash somewhere unrelated. The rootfs is not, by
+	  default, because it is tens of megabytes of OSPI reads on every boot
+	  to catch a corruption the filesystem itself would also catch.
+
+	  Worth turning on while bringing up a new push path.
+
+config RVT_UART_RX_RING
+	int "Console receive ring filled by the UART ISR, in bytes"
+	default 1024
+	depends on UART_INTERRUPT_DRIVEN
+	help
+	  The guest reads the console once per emulator slice (RV_SLICE_INSNS
+	  instructions, ~667 us at 15.37 MIPS) and uart_poll_in() holds one
+	  byte between reads, so without an ISR and this ring a pasted line
+	  loses most of its bytes. Losing the newline hangs the guest shell in
+	  read() forever, which is why the symptom is a dead console rather
+	  than mistyped input - BUILD.md gotcha 17.
+
+	  Size it for the longest line pasted in one go. 1024 covers a
+	  base64-encoded file chunk; the default emulator-side 8250 ring is
+	  only 64 bytes but drains every slice, so it is not the constraint.
+
+config RVT_EMU_PRIORITY
+	int "Priority of the thread running the emulator step loop"
+	default 10
+	depends on NETWORKING
+	help
+	  rv_machine_run_bounded() never blocks and never yields - a guest WFI
+	  returns early from riscv_cpu_interp() and spins - so with Zephyr's
+	  priority-based preemption any thread numerically above it would never
+	  run at all. The Renesas Ethernet RX thread sits at priority 2 and the
+	  TCP worker at 2, so main() lowers itself to this value before the
+	  image check. Guest instructions then run only in the time the network
+	  stack does not want, which is nearly all of it.
+
+menu "Guest telnet console"
+
+config RVT_TELNET
+	bool "Serve the guest console over TCP"
+	default y
+	depends on NETWORKING && NET_SOCKETS && NET_TCP && NET_IPV4
+	help
+	  Every byte of the guest's console already passes through
+	  plat_putc()/plat_getc() - the 8250 model in emu/rv_machine.c and the
+	  SBI debug console in emu/rv_hostsbi.c both go through them - so this
+	  option adds a TCP listener that takes over both ends while a client
+	  is attached, and a plain `telnet <board-ip>` lands on the guest's
+	  root shell. Nothing under emu/ changes and nothing in the guest can
+	  tell.
+
+	  With no client attached the console falls back to the physical UART,
+	  which is how the board is debugged.
+
+if RVT_TELNET
+
+config RVT_TELNET_PORT
+	int "TCP port"
+	default 23
+
+config RVT_TELNET_TX_RING
+	int "Guest-to-client buffer, bytes (power of two)"
+	default 8192
+	help
+	  Sized to absorb a kernel boot log burst without dropping. The
+	  emulator never blocks on this ring; once it is full, further guest
+	  output is discarded and counted, which is the only policy that does
+	  not risk stalling guest execution behind a TCP retransmit timeout.
+
+config RVT_TELNET_RX_RING
+	int "Client-to-guest buffer, bytes (power of two)"
+	default 1024
+
+config RVT_TELNET_MIRROR_UART
+	bool "Also copy guest output to the UART while a client is attached"
+	default n
+	help
+	  Handy when debugging the bridge itself. Costs one uart_poll_out()
+	  per guest character on the emulator's hot path, which at 921600 baud
+	  is about 11 us of busy-wait per byte, so leave it off normally.
+
+config RVT_TELNET_THREAD_PRIORITY
+	int "Telnet thread priority"
+	default 5
+	help
+	  Must outrank RVT_EMU_PRIORITY and rank below the networking threads
+	  at 2.
+
+config RVT_TELNET_THREAD_STACK
+	int "Telnet thread stack size"
+	default 4096
+
+endif # RVT_TELNET
+
+endmenu
+
+menu "Networking bring-up"
+	depends on NETWORKING
+
+config RVT_NET_STATIC_IP
+	bool "Configure a static IPv4 address instead of using DHCP"
+	default n
+
+config RVT_NET_ADDR
+	string "Static IPv4 address"
+	default "192.168.1.50"
+	depends on RVT_NET_STATIC_IP
+
+config RVT_NET_NETMASK
+	string "Static IPv4 netmask"
+	default "255.255.255.0"
+	depends on RVT_NET_STATIC_IP
+
+config RVT_NET_GATEWAY
+	string "Static IPv4 gateway"
+	default "192.168.1.1"
+	depends on RVT_NET_STATIC_IP
+
+config RVT_NET_DHCP_WAIT_S
+	int "Seconds to wait for DHCP before booting the guest"
+	default 15
+	depends on !RVT_NET_STATIC_IP
+	help
+	  Boot is held here only so the address can be printed on the console
+	  before the guest's own output starts. On timeout the guest boots
+	  anyway and DHCP keeps running in the background; the address is
+	  printed whenever it does arrive.
+
+config RVT_NET_FALLBACK_ADDR
+	string "Static IPv4 address to apply if DHCP times out"
+	default ""
+	depends on !RVT_NET_STATIC_IP
+	help
+	  Leave empty to disable. DHCP is left running, so a lease arriving
+	  later still takes effect.
+
+config RVT_NET_FALLBACK_NETMASK
+	string "Netmask for the DHCP fallback address"
+	default "255.255.255.0"
+	depends on !RVT_NET_STATIC_IP
+
+endmenu
+
+source "Kconfig.zephyr"

@@ -1,0 +1,507 @@
+/*
+ * Emulated RISC-V Linux on the Renesas EK-RA8D1 (Cortex-M85 @ 480 MHz).
+ *
+ * Runs cnlohr's mini-rv32ima interpreter over the board's 64 MB external
+ * SDRAM, booting a rv32ima nommu Linux kernel with an embedded initramfs.
+ *
+ * Why this shape:
+ *   - Cortex-M85 has no MMU, and upstream Linux arch/arm NOMMU supports only
+ *     ARMv7-M, so native Linux is impossible here. Emulating a RISC-V gives
+ *     the guest a real MMU and lets a stock kernel run unmodified.
+ *   - The kernel image is 3.4 MB, larger than the 2 MB internal flash, so it
+ *     lives in the 64 MB octo-SPI NOR at CS1. That NOR is memory-mapped at
+ *     0x90000000, so loading the guest is a plain memcpy with no driver in
+ *     the path.
+ *
+ * Memory map:
+ *   0x68000000  64 MB SDRAM   guest RAM (guest sees it as 0x80000000)
+ *   0x90000000  64 MB OSPI    0x00000-0x1FFFF CIRCUITPY fs, 0x2000 is the
+ *                             OSPI driver's autocalibration sector.
+ *                             Our image header lives at 0x40000.
+ *
+ * If no valid image is found in flash the app drops into a UART loader so
+ * the image can be pushed once; it persists across resets and app reflashes.
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/sys/crc.h>
+#include <zephyr/cache.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------ layout */
+
+#define SDRAM_BASE      DT_REG_ADDR(DT_NODELABEL(sdram1))
+#define SDRAM_SIZE      DT_REG_SIZE(DT_NODELABEL(sdram1))
+
+/* Guest RAM. The whole SDRAM is handed to the guest; the DTB and the
+ * emulator's own state live in the top of it, exactly as the reference
+ * implementation arranges them. */
+#define GUEST_RAM_SIZE  SDRAM_SIZE
+
+/* Memory-mapped window of the OSPI NOR on CS1, from the FSP BSP:
+ * BSP_FEATURE_OSPI_B_DEVICE_1_START_ADDRESS. Reads through here are the
+ * same operation Zephyr's flash_read() performs internally. */
+#define OSPI_MMAP_BASE  0x90000000UL
+
+/* Image slot. 0x40000 is the first 256 KB erase block, past both the
+ * CIRCUITPY filesystem and the driver's autocalibration sector. */
+#define IMG_FLASH_OFF   0x40000UL
+#define IMG_MMAP_ADDR   (OSPI_MMAP_BASE + IMG_FLASH_OFF)
+#define IMG_MAGIC       "RA8LINUX"
+#define IMG_HDR_SIZE    16U
+#define IMG_PAYLOAD_OFF 4096U   /* header gets its own aligned block */
+#define OSPI_ERASE_SZ   (256U * 1024U)
+
+struct img_hdr {
+	char     magic[8];
+	uint32_t len;
+	uint32_t crc;
+};
+
+/* --------------------------------------------------------------- emulator */
+
+#define MINI_RV32_RAM_SIZE   GUEST_RAM_SIZE
+#define MINIRV32_IMPLEMENTATION
+
+static uint32_t mmio_store(uint32_t addy, uint32_t val);
+static uint32_t mmio_load(uint32_t addy);
+
+/* The syscon path signals poweroff/reboot by returning the written value up
+ * through MiniRV32IMAStep. That `return val` is load-bearing. */
+#define MINIRV32_HANDLE_MEM_STORE_CONTROL(addy, val) \
+	if (mmio_store(addy, val)) return val;
+#define MINIRV32_HANDLE_MEM_LOAD_CONTROL(addy, rval) \
+	rval = mmio_load(addy);
+
+#include "mini-rv32ima.h"
+#include "default64mbdtc.h"
+
+static struct MiniRV32IMAState *core;
+
+/* ------------------------------------------------------------------- uart */
+
+static const struct device *const uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+
+static inline void up(char c)
+{
+	uart_poll_out(uart, c);
+}
+
+static void us(const char *s)
+{
+	while (*s) {
+		up(*s++);
+	}
+}
+
+static void uhex(uint32_t v)
+{
+	static const char d[] = "0123456789abcdef";
+	for (int i = 28; i >= 0; i -= 4) {
+		up(d[(v >> i) & 0xf]);
+	}
+}
+
+static void udec(uint32_t v)
+{
+	char b[11];
+	int n = 0;
+	if (!v) {
+		up('0');
+		return;
+	}
+	while (v) {
+		b[n++] = '0' + (v % 10);
+		v /= 10;
+	}
+	while (n--) {
+		up(b[n]);
+	}
+}
+
+/* One-byte lookahead. The guest polls the 8250 LSR far more often than a
+ * byte actually arrives, so keep the peeked byte here rather than dropping
+ * it between the LSR read and the data read. */
+static int rx_have = -1;
+
+static int rx_poll(void)
+{
+	unsigned char c;
+
+	if (rx_have >= 0) {
+		return rx_have;
+	}
+	if (uart_poll_in(uart, &c) == 0) {
+		rx_have = c;
+	}
+	return rx_have;
+}
+
+static int rx_take(void)
+{
+	int c = rx_poll();
+
+	rx_have = -1;
+	return c;
+}
+
+/* Blocking read used only by the loader, never on the guest hot path. */
+static int rx_block(k_timeout_t to)
+{
+	int64_t end = k_uptime_get() + k_ticks_to_ms_floor64(to.ticks);
+	int c;
+
+	do {
+		c = rx_take();
+		if (c >= 0) {
+			return c;
+		}
+	} while (k_uptime_get() < end);
+
+	return -1;
+}
+
+/* ------------------------------------------------------- emulated devices */
+
+/* 8250 UART at 0x10000000, CLINT at 0x11000000, syscon at 0x11100000.
+ * These addresses come from the DTB compiled into default64mbdtc.h. */
+static uint32_t mmio_store(uint32_t addy, uint32_t val)
+{
+	if (addy == 0x10000000) {          /* UART TX */
+		up((char)val);
+	} else if (addy == 0x11004004) {   /* CLINT timermatch high */
+		core->timermatchh = val;
+	} else if (addy == 0x11004000) {   /* CLINT timermatch low */
+		core->timermatchl = val;
+	} else if (addy == 0x11100000) {   /* syscon: reboot / poweroff */
+		core->pc = core->pc + 4;
+		return val;
+	}
+	return 0;
+}
+
+static uint32_t mmio_load(uint32_t addy)
+{
+	if (addy == 0x10000005) {          /* UART LSR: THR empty | RX ready */
+		return 0x60 | (rx_poll() >= 0 ? 1 : 0);
+	} else if (addy == 0x10000000) {   /* UART RX */
+		int c = rx_take();
+
+		return (c >= 0) ? (uint32_t)c : 0;
+	} else if (addy == 0x1100bffc) {
+		return core->timerh;
+	} else if (addy == 0x1100bff8) {
+		return core->timerl;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ timer */
+
+/* The guest's timebase is declared as 1 MHz in the DTB, so the emulator wants
+ * elapsed microseconds. k_cycle_get_32() wraps every ~8.9 s at 480 MHz, which
+ * is far longer than one step batch, so accumulate into 64 bits as we go. */
+static uint32_t cyc_last;
+static uint64_t cyc_total;
+
+static uint64_t now_us(void)
+{
+	uint32_t c = k_cycle_get_32();
+
+	cyc_total += (uint32_t)(c - cyc_last);
+	cyc_last = c;
+
+	return cyc_total / (uint64_t)(sys_clock_hw_cycles_per_sec() / 1000000U);
+}
+
+/* ------------------------------------------------------------- image load */
+
+static const struct device *const nor = DEVICE_DT_GET(DT_NODELABEL(s28hl512t));
+
+static int img_check(uint32_t *len_out)
+{
+	const struct img_hdr *h = (const struct img_hdr *)IMG_MMAP_ADDR;
+	const uint8_t *body = (const uint8_t *)(IMG_MMAP_ADDR + IMG_PAYLOAD_OFF);
+
+	if (memcmp(h->magic, IMG_MAGIC, 8) != 0) {
+		return -1;
+	}
+	if (h->len == 0 || h->len > (64U * 1024 * 1024 - IMG_FLASH_OFF - IMG_PAYLOAD_OFF)) {
+		return -2;
+	}
+	if (crc32_ieee(body, h->len) != h->crc) {
+		return -3;
+	}
+
+	*len_out = h->len;
+	return 0;
+}
+
+/* Receive an image over the console UART and commit it to OSPI.
+ *
+ * Protocol, host -> board:
+ *   'S' then 4-byte LE length then 4-byte LE crc32, then raw bytes.
+ * Board acknowledges each 4 KB block with 'K' so the host cannot outrun the
+ * flash writes. At 115200 this is ~5 min for 3.4 MB; the console runs at
+ * 115200 here, so that is the figure to expect.
+ */
+static int img_receive(void)
+{
+	static uint8_t buf[4096];
+	struct img_hdr h;
+	uint32_t len, crc, off = 0;
+	int c;
+
+	us("\r\nLOADER: waiting for image ('S' + len32le + crc32le + data)\r\n");
+
+	do {
+		c = rx_block(K_SECONDS(600));
+		if (c < 0) {
+			us("LOADER: timeout\r\n");
+			return -1;
+		}
+	} while (c != 'S');
+
+	len = 0;
+	for (int i = 0; i < 4; i++) {
+		c = rx_block(K_SECONDS(5));
+		if (c < 0) {
+			return -1;
+		}
+		len |= (uint32_t)c << (8 * i);
+	}
+	crc = 0;
+	for (int i = 0; i < 4; i++) {
+		c = rx_block(K_SECONDS(5));
+		if (c < 0) {
+			return -1;
+		}
+		crc |= (uint32_t)c << (8 * i);
+	}
+
+	us("LOADER: len=");
+	udec(len);
+	us(" crc=");
+	uhex(crc);
+	us("\r\n");
+
+	if (!device_is_ready(nor)) {
+		us("LOADER: NOR not ready\r\n");
+		return -1;
+	}
+
+	/* Erase enough 256 KB blocks for header + payload. */
+	uint32_t need = ROUND_UP(len + IMG_PAYLOAD_OFF, OSPI_ERASE_SZ);
+
+	us("LOADER: erasing ");
+	udec(need / 1024);
+	us(" KB\r\n");
+	if (flash_erase(nor, IMG_FLASH_OFF, need) != 0) {
+		us("LOADER: erase failed\r\n");
+		return -1;
+	}
+
+	/* Erasing several MB of NOR takes tens of seconds, and this loader does
+	 * not buffer the UART. Anything the host sends during the erase is lost
+	 * in the FIFO. Tell the host explicitly when we are ready to receive,
+	 * and drop whatever arrived early. */
+	rx_have = -1;
+	while (rx_take() >= 0) {
+		/* drain */
+	}
+	us("\r\n<RDY>\r\n");
+
+	/* Payload first, header last, so a truncated transfer never leaves a
+	 * valid-looking header pointing at a partial image. */
+	while (off < len) {
+		uint32_t n = MIN((uint32_t)sizeof(buf), len - off);
+
+		for (uint32_t i = 0; i < n; i++) {
+			c = rx_block(K_SECONDS(10));
+			if (c < 0) {
+				us("LOADER: rx timeout at ");
+				udec(off + i);
+				us("\r\n");
+				return -1;
+			}
+			buf[i] = (uint8_t)c;
+		}
+
+		if (flash_write(nor, IMG_FLASH_OFF + IMG_PAYLOAD_OFF + off, buf, n) != 0) {
+			us("LOADER: write failed\r\n");
+			return -1;
+		}
+		off += n;
+		up('K');
+	}
+
+	memset(buf, 0xFF, sizeof(buf));
+	memcpy(h.magic, IMG_MAGIC, 8);
+	h.len = len;
+	h.crc = crc;
+	memcpy(buf, &h, sizeof(h));
+
+	int wrc = flash_write(nor, IMG_FLASH_OFF, buf, IMG_PAYLOAD_OFF);
+
+	if (wrc != 0) {
+		us("\r\nLOADER: header write failed rc=");
+		udec((uint32_t)(-wrc));
+		us(" wbs=");
+		udec((uint32_t)flash_get_write_block_size(nor));
+		us("\r\n");
+		return -1;
+	}
+
+	/* The memory-mapped window is cacheable, so invalidate before verifying
+	 * through it or we may read pre-erase lines. */
+	sys_cache_data_invd_range((void *)IMG_MMAP_ADDR, need);
+
+	uint32_t vlen;
+
+	if (img_check(&vlen) != 0) {
+		us("\r\nLOADER: verify FAILED\r\n");
+		return -1;
+	}
+
+	us("\r\nLOADER: image committed and verified\r\n");
+	return 0;
+}
+
+/* ------------------------------------------------------------------- boot */
+
+static void guest_prepare(uint32_t img_len)
+{
+	uint8_t *ram = (uint8_t *)SDRAM_BASE;
+	uint32_t dtb_ptr;
+
+	us("copy ");
+	udec(img_len);
+	us(" B flash->sdram... ");
+
+	int64_t t0 = k_uptime_get();
+
+	/* Kernel at guest offset 0, everything above it zeroed: the guest's
+	 * .bss and free pages must start clean. */
+	memcpy(ram, (const void *)(IMG_MMAP_ADDR + IMG_PAYLOAD_OFF), img_len);
+	memset(ram + img_len, 0, GUEST_RAM_SIZE - img_len);
+
+	us("ok ");
+	udec((uint32_t)(k_uptime_get() - t0));
+	us(" ms\r\n");
+
+	/* DTB then emulator state occupy the top of guest RAM. */
+	dtb_ptr = GUEST_RAM_SIZE - sizeof(default64mbdtb) -
+		  sizeof(struct MiniRV32IMAState);
+	memcpy(ram + dtb_ptr, default64mbdtb, sizeof(default64mbdtb));
+
+	/* Patch the DTB's memory size. The stock blob carries sentinel
+	 * 0x00c0ff03 at byte 0x13c; without this the guest believes it has
+	 * 64 MB of usable RAM and walks over the DTB and our own state. */
+	uint32_t *dtb = (uint32_t *)(ram + dtb_ptr);
+
+	if (dtb[0x13c / 4] == 0x00c0ff03) {
+		uint32_t v = dtb_ptr;
+
+		dtb[0x13c / 4] = (v >> 24) | (((v >> 16) & 0xff) << 8) |
+				 (((v >> 8) & 0xff) << 16) | ((v & 0xff) << 24);
+	} else {
+		us("WARN: dtb ram sentinel not found\r\n");
+	}
+
+	core = (struct MiniRV32IMAState *)(ram + GUEST_RAM_SIZE -
+					   sizeof(struct MiniRV32IMAState));
+	memset(core, 0, sizeof(*core));
+
+	core->pc = MINIRV32_RAM_IMAGE_OFFSET;
+	core->regs[10] = 0x00;                                  /* a0 = hart id  */
+	core->regs[11] = dtb_ptr + MINIRV32_RAM_IMAGE_OFFSET;   /* a1 = DTB phys */
+	core->extraflags |= 3;                                  /* machine mode  */
+}
+
+int main(void)
+{
+	uint32_t img_len = 0;
+	int rc;
+
+	if (!device_is_ready(uart)) {
+		return -1;
+	}
+
+	us("\r\n=== rv32ima Linux on EK-RA8D1 ===\r\n");
+	us("core ");
+	udec(sys_clock_hw_cycles_per_sec() / 1000000U);
+	us(" MHz, sdram ");
+	udec(SDRAM_SIZE / (1024 * 1024));
+	us(" MB @ 0x");
+	uhex(SDRAM_BASE);
+	us("\r\n");
+
+	rc = img_check(&img_len);
+	if (rc != 0) {
+		us("no valid image at 0x");
+		uhex(IMG_MMAP_ADDR);
+		us(" (rc ");
+		udec((uint32_t)(-rc));
+		us(")\r\n");
+
+		if (img_receive() != 0 || img_check(&img_len) != 0) {
+			us("FATAL: no image, halting\r\n");
+			return -1;
+		}
+	}
+
+	us("image ok, ");
+	udec(img_len);
+	us(" bytes\r\n");
+
+	guest_prepare(img_len);
+
+	us("booting guest...\r\n\r\n");
+
+	cyc_last = k_cycle_get_32();
+	cyc_total = 0;
+
+	uint64_t last_us = now_us();
+	int64_t t_boot = k_uptime_get();
+
+	for (;;) {
+		uint64_t t = now_us();
+		uint32_t elapsed = (uint32_t)(t - last_us);
+
+		last_us = t;
+
+		int ret = MiniRV32IMAStep(core, (uint8_t *)SDRAM_BASE, 0,
+					  elapsed, 1024);
+
+		switch (ret) {
+		case 0:
+			break;
+		case 1:
+			/* WFI: nothing to do but keep the guest clock moving. */
+			k_busy_wait(50);
+			break;
+		case 3:
+			/* Fault. Keep running; the guest may recover. */
+			break;
+		case 0x7777:
+			us("\r\n[reboot requested]\r\n");
+			guest_prepare(img_len);
+			break;
+		case 0x5555:
+			us("\r\n[poweroff] after ");
+			udec((uint32_t)(k_uptime_get() - t_boot));
+			us(" ms, cycles 0x");
+			uhex(core->cycleh);
+			uhex(core->cyclel);
+			us("\r\n");
+			return 0;
+		default:
+			us("\r\n[unknown step result]\r\n");
+			break;
+		}
+	}
+}

@@ -1,0 +1,42 @@
+# Build output. Every one of these is reproducible from source with west.
+build/
+build-*/
+*.o
+*.obj
+*.d
+
+# Guest images and firmware binaries. The tree is 2.9 GB with these in and
+# ~2 MB without; they are build artifacts of the Buildroot recipe in BUILD.md,
+# not sources. The known-good ELF archive is deliberately excluded too - it is
+# a local recovery cache, and a stale "known-good" binary in git is worse than
+# no binary at all (see known-good/README.txt).
+*.elf
+*.bin
+*.ext2
+*.uf2
+*.img
+Image
+Image-*
+rootfs
+rootfs-*
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Serial captures and logs from bring-up runs.
+*.log
+!host-boot.log
+
+# Upstream checkout, not our code: a pristine clone of
+# https://github.com/cnlohr/mini-rv32ima at 84858f5 with no local
+# modifications. Re-clone it there rather than vendoring a copy here.
+ra8d1-linux/emulator/
+
+# Local tooling noise
+.venv/
+__pycache__/
+*.pyc
+.cache/
+.DS_Store
+compile_commands.json

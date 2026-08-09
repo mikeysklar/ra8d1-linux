@@ -1,0 +1,90 @@
+/*
+ * EK-RA8D1 wiring for the TinyEMU app.
+ *
+ * Everything here is specific to this board: node labels like `uart9`,
+ * `s28hl512t` and `iic1` exist on the EK-RA8D1 and nowhere else. Porting
+ * means writing a sibling `boards/<board>.overlay` and changing no source.
+ *
+ * Note there is deliberately no `app.overlay`. Zephyr picks the application
+ * devicetree overlay by a fallback chain, not a merge, so once
+ * `boards/<board>.overlay` exists an `app.overlay` would silently do nothing.
+ */
+
+/* Console at 921600 rather than 115200: the loader pushes multi-megabyte
+ * images, and at 115200 that is ~6 minutes per push against ~40 s here. The
+ * rvlinux app on this board runs its console here too, so one terminal
+ * setting works for both.
+ *
+ * Halved to 460800 on 2026-08-08 while hunting the dead-console bug, then put
+ * back: input broke at *exactly* the same 40-character line at both rates,
+ * which is what ruled the baud rate out. The fault was polled receive, not
+ * speed - see CONFIG_UART_INTERRUPT_DRIVEN in prj.conf. Do not re-halve this
+ * hoping to fix console input; that experiment has been run.
+ */
+&uart9 {
+	current-speed = <921600>;
+};
+
+/*
+ * iic1 is the RIIC controller on P512 (SCL) / P511 (SDA). The board DTS wires
+ * up its pinctrl but leaves it disabled, because on this board those pins are
+ * the MIPI graphics expansion header (J58) and the DVP camera connector (J13)
+ * and only a shield normally drives them. The paravirt I/O bridge exposes it
+ * to the guest, so turn it on the same way the Renesas LCD shield overlays
+ * do. 100 kHz rather than the board's Fast Mode Plus default: with flying
+ * leads and whatever pull-ups the attached breakout brings, slow is the
+ * setting that works.
+ */
+&iic1 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	clock-frequency = <DT_FREQ_K(100)>;
+	pinctrl-0 = <&iic1_default>;
+	pinctrl-names = "default";
+};
+
+/*
+ * Two image slots in the octo-SPI NOR, at exactly the offsets the rvlinux app
+ * on this board already uses and its TCP pusher already writes:
+ *
+ *   0x0000000  CIRCUITPY filesystem, and the OSPI driver's autocalibration
+ *              sector at 0x2000
+ *   0x0040000  kernel, 8 MB, magic "RA8LINUX"
+ *   0x0840000  rootfs, 55.75 MB, magic "RA8ROOTF"
+ *
+ * Adopting those offsets rather than claiming our own is the whole point: an
+ * image pushed with the tested tool boots under this app unchanged, and the
+ * two apps can share a board without either having to reflash the other's
+ * images. src/platform_zephyr.c BUILD_ASSERTs the geometry so a well-meant
+ * edit here cannot silently break that.
+ *
+ * The rootfs slot is deliberately enormous. It is read in place through the
+ * memory-mapped window and never copied, so its size costs no SDRAM at all -
+ * it costs only flash, and the flash is otherwise unused.
+ */
+&s28hl512t {
+	/delete-node/ partitions;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* CIRCUITPY, and the driver's autocalibration sector. */
+		nor_partition: partition@0 {
+			label = "nor";
+			reg = <0x00000000 0x00040000>;
+		};
+
+		rvl_kernel_partition: partition@40000 {
+			label = "kernel";
+			reg = <0x00040000 0x00800000>;
+		};
+
+		rvl_rootfs_partition: partition@840000 {
+			label = "rootfs";
+			reg = <0x00840000 0x037c0000>;
+		};
+	};
+};

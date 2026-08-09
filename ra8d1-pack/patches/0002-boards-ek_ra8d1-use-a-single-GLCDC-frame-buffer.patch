@@ -1,0 +1,37 @@
+From e86c5c8aebf3533737e8b246d60e5aaa7fdee2aa Mon Sep 17 00:00:00 2001
+From: RA8D1 port <noreply@example.invalid>
+Date: Fri, 7 Aug 2026 13:54:16 +0000
+Subject: [PATCH 2/4] boards: ek_ra8d1: use a single GLCDC frame buffer
+
+With two frame buffers, display_renesas_ra.c takes the buffer-change
+path, sets vsync_wait and blocks on k_sem_take(frame_buf_sem, K_FOREVER).
+That semaphore is only given by the GLCDC line-detect interrupt, which
+does not fire on this board, so the main thread blocks forever on the
+first displayio refresh.
+
+The failure is silent and total: the boot banner reaches the panel
+because the first buffer change lands before the wait, then the console,
+USB servicing, code.py and the REPL all stop together.
+
+A single frame buffer avoids the buffer-change path. The alternative fix
+is to bound the wait in the driver.
+---
+ ports/zephyr-cp/boards/ek_ra8d1.conf | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ports/zephyr-cp/boards/ek_ra8d1.conf b/ports/zephyr-cp/boards/ek_ra8d1.conf
+index 451f41991..2e7b463f3 100644
+--- a/ports/zephyr-cp/boards/ek_ra8d1.conf
++++ b/ports/zephyr-cp/boards/ek_ra8d1.conf
+@@ -10,3 +10,8 @@ CONFIG_USBD_MAX_UDC_MSG=32
+ CONFIG_USBD_MSG_SLAB_COUNT=32
+ CONFIG_UDC_BUF_COUNT=32
+ CONFIG_UDC_BUF_POOL_SIZE=2048
++
++# FIX-GLCDC-FBNUM: GLCDC line-detect IRQ never fires, so ra_display_write blocks
++# forever on k_sem_take(frame_buf_sem, K_FOREVER) at display_renesas_ra.c:146.
++# Single frame buffer avoids the buffer-change path that sets vsync_wait.
++CONFIG_RENESAS_RA_GLCDC_FB_NUM=1
+-- 
+2.50.1 (Apple Git-155)
+

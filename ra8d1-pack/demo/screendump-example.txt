@@ -1,0 +1,128 @@
+
+]0;🐍Done | 10.3.0-alpha.4-23-g869d51b20\soft reboot
+[2K[0Gcode.py output:
+]0;🐍code.py | 10.3.0-alpha.4-23-g869d51b20\UID shorter 16 than defined length 32
+=== RA8D1 DASHBOARD ===
+display 480x854  heap 66071808  fs 109568/121856
+frame 0  up 0.2s  free 66091472  alloc 31792
+SCREENDUMP 480 854
+R|0|0|480|854|070a0f
+R|0|0|480|40|121821
+R|0|40|480|2|2dd4e8
+T|8|8|2|2dd4e8|RA8D1
+T|82|14|1|e8eef5|CIRCUITPYTHON
+T|370|14|1|7a8a9e|RENESAS  EK-RA8D1
+R|8|50|464|108|121821
+R|8|50|464|1|27313e
+R|8|157|464|1|27313e
+R|8|50|3|108|2dd4e8
+T|18|56|1|2dd4e8|SILICON
+T|18|74|1|7a8a9e|part
+T|158|74|1|e8eef5|r7fa8d1bhecbd
+T|18|91|1|7a8a9e|core
+T|158|91|1|e8eef5|Cortex-M85  v8.1-M
+T|18|108|1|7a8a9e|clock
+T|158|108|1|4ade80|480 MHz
+T|18|125|1|7a8a9e|uid
+T|158|125|1|a78bfa|<board-uid-hi16>
+T|18|142|1|7a8a9e|
+T|158|142|1|a78bfa|<board-uid-lo16>
+R|8|166|464|91|121821
+R|8|166|464|1|27313e
+R|8|256|464|1|27313e
+R|8|166|3|91|2dd4e8
+T|18|172|1|2dd4e8|FIRMWARE
+T|18|190|1|7a8a9e|version
+T|158|190|1|4ade80|10.3.0
+T|18|207|1|7a8a9e|build
+T|158|207|1|e8eef5|10.3.0-alpha.4-23-g869d51b20
+T|18|224|1|7a8a9e|dated
+T|158|224|1|e8eef5|2026-08-06
+T|18|241|1|7a8a9e|board id
+T|158|241|1|e8eef5|renesas_ek_ra8d1
+R|8|265|464|91|121821
+R|8|265|464|1|27313e
+R|8|355|464|1|27313e
+R|8|265|3|91|2dd4e8
+T|18|271|1|2dd4e8|DISPLAY
+T|18|289|1|7a8a9e|panel
+T|158|289|1|4ade80|480 x 854
+T|18|306|1|7a8a9e|controller
+T|158|306|1|e8eef5|ILI9806E  MIPI-DSI
+T|18|323|1|7a8a9e|pipeline
+T|158|323|1|e8eef5|displayio -> GLCDC
+T|18|340|1|7a8a9e|rotation
+T|158|340|1|e8eef5|0 deg
+R|8|364|464|108|121821
+R|8|364|464|1|27313e
+R|8|471|464|1|27313e
+R|8|364|3|108|2dd4e8
+T|18|370|1|2dd4e8|MEMORY
+T|18|388|1|7a8a9e|heap free
+T|158|388|1|4ade80|63.0 MB
+T|18|405|1|7a8a9e|heap used
+T|158|405|1|e8eef5|31.1 KB
+T|18|422|1|7a8a9e|peak free
+T|158|422|1|a78bfa|63.0 MB
+T|18|439|1|7a8a9e|filesystem
+T|158|439|1|e8eef5|107.0 KB free / 119.0
+R|18|458|444|8|27313e
+R|18|458|4|8|4ade80
+R|8|480|464|122|121821
+R|8|480|464|1|27313e
+R|8|601|464|1|27313e
+R|8|480|3|122|2dd4e8
+T|18|486|1|2dd4e8|I / O   live
+T|18|504|1|7a8a9e|leds
+T|158|504|1|7a8a9e|L0
+R|178|505|12|12|4ade80
+T|210|504|1|7a8a9e|L1
+R|230|505|12|12|27313e
+T|262|504|1|7a8a9e|L2
+R|282|505|12|12|27313e
+T|314|504|1|7a8a9e|L3
+R|334|505|12|12|27313e
+T|18|538|1|7a8a9e|buttons
+T|158|538|1|7a8a9e|SW1
+R|184|539|12|12|27313e
+T|236|538|1|7a8a9e|SW2
+R|262|539|12|12|27313e
+T|18|572|1|7a8a9e|buses
+T|158|572|1|e8eef5|I2C  SPI  UART3/9  PWM
+R|8|610|464|108|121821
+R|8|610|464|1|27313e
+R|8|717|464|1|27313e
+R|8|610|3|108|2dd4e8
+T|18|616|1|2dd4e8|RUNTIME
+T|18|634|1|7a8a9e|uptime
+T|158|634|1|4ade80|0m 01s
+T|18|651|1|7a8a9e|frames
+T|158|651|1|e8eef5|4
+T|18|668|1|7a8a9e|ticks_ms
+T|158|668|1|e8eef5|132816
+T|18|685|1|7a8a9e|run reason
+T|158|685|1|e8eef5|REPL_RELOAD
+T|18|702|1|7a8a9e|storage
+T|158|702|1|4ade80|CIRCUITPY  writable
+R|8|726|464|91|121821
+R|8|726|464|1|27313e
+R|8|816|464|1|27313e
+R|8|726|3|91|2dd4e8
+T|18|732|1|2dd4e8|NOTES
+T|18|750|1|4ade80|REPL + file push over J-Link VCOM   OK
+T|18|767|1|fbbf24|USB MSC  RA8 HS bulk-IN stalls (upstream)
+T|18|784|1|7a8a9e|cpu.temperature / voltage are port stubs
+T|18|801|1|a78bfa|GLCDC + FatFs boot-jump fixes applied
+R|0|828|480|26|121821
+R|0|826|480|2|27313e
+T|8|835|1|7a8a9e|live     2.7 fps     63.0 MB free
+R|460|835|10|10|121821
+ENDDUMP
+frame 25  up 8.8s  free 66091328  alloc 31936
+frame 50  up 16.9s  free 66091328  alloc 31936
+
+============================================================
+bytes: 3497
+  dashboard started    YES
+  frames advancing     YES
+  EXCEPTION            no
