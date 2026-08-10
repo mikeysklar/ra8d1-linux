@@ -782,3 +782,151 @@ evidence, not as a diagnosis.
 3m15s erase. Erase is now 2m53s for the same 217 blocks. The cost was never the
 reading; it was the single `sys_cache_data_invd_range()` of 1.78 million
 cache-line operations.
+
+---
+
+## 2026-08-09: run 2, and the actual difference from rvlinux
+
+### First, my run-1 reading was incomplete, and run 2 says so
+
+Run 1 looked like "healthy board, impatient host". The prediction written before
+run 2 was: *dies at a similar offset → it is a deadlock, not a pause, and more
+timeout will never help.* **That branch fired.** Run 2 had a 2.5x longer timeout
+(300 s vs 120 s) and died **earlier** — offset 5,980,160 against 6,848,512 — with
+the failure travelling in the opposite direction (`BrokenPipeError`, the board's
+RST reaching the host, rather than the host's timeout reaching the board).
+
+A longer timeout producing an earlier death rules out "the host was merely
+impatient" as the whole story. The host timeout is real and still needs
+`--rx-timeout 600`, but it is a symptom.
+
+### One correction to the cluster before using it
+
+The three deaths are quoted as 6,561,792 / 6,848,512 / 5,980,160. **The first one
+does not belong.** 6,561,792 is 99.6% of a 6,577,272-byte image — it died
+**15,480 bytes from the end of its own payload**, in the end-of-transfer drain,
+which is a different event from dying at 11% of a 54 MB payload. Its offset is
+near 6 MB because the *image* was 6.5 MB, not because 6 MB is a limit.
+
+That leaves two real points, 5,980,160 and 6,848,512: **a 15% spread**. That is
+the signature of a probabilistic failure — pressure that eventually loses a
+dice roll — not of a resource that runs out at a fixed count.
+
+### Run 2's timeline closes exactly
+
+- Board consumed 5,980,160 B in 82 s = **71.2 KB/s**, the flash write rate.
+- Tool's last progress: 9.69 MB at elapsed 1m22s = **82 s**. Same instant.
+- Gap between them: 9.69 - 5.70 = **3.99 MB**, the host-side socket buffer,
+  the same ~4 MB seen in run 1.
+
+Both ends stopped together. Nothing stalled first.
+
+### The RST is our own close, not a stack-initiated abort
+
+`BrokenPipeError` on the host means the board sent RST. It did — but as a
+consequence, not a cause. `nl_recv()` returned -1 (`pusher: rx error`),
+`nl_push()` returned, and `zsock_close()` on a socket with unread data queued
+emits RST. **The primary event is `zsock_poll()`/`zsock_recv()` failing the
+socket**, i.e. Zephyr's TCP giving up on the connection.
+
+### Net pool sizes are identical to rvlinux, so that is not it
+
+Checked directly, `rvlinux/prj.conf` against `ra8d1-tinyemu/prj.conf`:
+
+| | rvlinux | tinyemu |
+|---|---|---|
+| `NET_PKT_RX_COUNT` | 16 | 16 |
+| `NET_PKT_TX_COUNT` | 16 | 16 |
+| `NET_BUF_RX_COUNT` | 32 | 32 |
+| `NET_BUF_TX_COUNT` | 32 | 32 |
+| `NET_MAX_CONTEXTS` / `NET_MAX_CONN` | 6 / 6 | 6 / 6 |
+
+Byte for byte the same. rvlinux pushes 54 MB through this silicon with these
+numbers, so the pool sizes alone cannot be the explanation.
+
+### What IS different: promiscuous mode clones every frame
+
+`CONFIG_NET_PROMISCUOUS_MODE=y` is new in this app, for the guest NIC bridge.
+rvlinux does not have it. And it is not a passive flag —
+`subsys/net/ip/net_if.c:5946`:
+
+```c
+enum net_verdict net_if_recv_data(struct net_if *iface, struct net_pkt *pkt)
+{
+        if (IS_ENABLED(CONFIG_NET_PROMISCUOUS_MODE) &&
+            net_if_is_promisc(iface)) {
+                struct net_pkt *new_pkt;
+
+                new_pkt = net_pkt_clone(pkt, K_NO_WAIT);
+                ...
+```
+
+**Every frame the interface receives is deep-copied** — a second `net_pkt` and a
+second full chain of `net_buf`s — before normal delivery. The arithmetic against
+this build's pools is brutal:
+
+| | |
+|---|---:|
+| `CONFIG_NET_BUF_DATA_SIZE` (fixed) | 128 B |
+| net_bufs for one 1514 B frame | **12** |
+| `CONFIG_NET_BUF_RX_COUNT` (whole RX pool) | **32** (4 KB) |
+| one in-flight full frame **with** its promiscuous clone | **24 of 32** |
+| frames per second at 71 KB/s | ~50 |
+
+**One full-size frame in flight consumes three quarters of the RX buffer pool.
+Two exhaust it.** That is the pressure a 54 MB push has to survive for a quarter
+of an hour, and it is exactly the thing rvlinux does not do.
+
+Failures under that pressure are dropped frames, retransmissions, and eventually
+a connection Zephyr gives up on (`CONFIG_NET_TCP_RETRY_COUNT=9`) — which is a
+probabilistic process with a 15% spread in when it bites, not a fixed limit. It
+fits the two real data points and it fits rvlinux's success.
+
+**Checked for a leak and there is not one.** When `net_pkt_clone()` fails under
+pressure it returns NULL, `net_promisc_mode_input(NULL)` returns `NET_CONTINUE`
+rather than `NET_DROP`, and the `net_pkt_unref()` is skipped — correctly, since
+there is nothing to free. `nb_rx_thread()` unrefs on every path it takes. This
+is allocation pressure, not accumulation; nobody needs to go hunting a leak.
+
+### Fix: drop promiscuous mode when the guest stops
+
+`rvt_netbridge_suspend()`, called from `halt_guest()` the moment the emulator
+acknowledges the stop. With the guest halted the bridge has nobody to deliver
+to, so every clone from that point on is allocated, filtered and freed having
+achieved nothing. Turning it off removes the clone from the receive path for the
+whole of the push and leaves the board's own IP traffic untouched.
+
+There is no resume. The guest cannot run again without a reboot, so nothing
+would consume what the bridge delivers.
+
+**Deliberately the only change.** The obvious second lever — raising
+`NET_BUF_RX_COUNT` from 32 to 128 and `NET_PKT_RX_COUNT` to 32, about 12 KB of
+SRAM — is written down here and **not applied**, because changing both at once
+means a successful next run tells us nothing about which one mattered. This
+project has already spent a hardware cycle on a fix that was reasoned into place
+without a controlled test. Promiscuous-off goes first because it is the only
+receive-path difference from the configuration that demonstrably does 54 MB.
+
+If the next 54 MB push still dies in the 5-7 MB band, the pool bump is the next
+single change, and the one after that is `CONFIG_NET_BUF_DATA_SIZE` — at 128 B a
+full frame costs 12 buffers, and 512 would cost 3.
+
+### The wedge did not recur
+
+Two full 54 MB attempts under `HW_STACK_PROTECTION=y` plus the payload
+instrumentation, and the board stayed alive, printing and pingable through both,
+ending each with its own diagnostics. The original symptom — no ping, no socket,
+silent UART, reset-only recovery — **did not reproduce**. That is data, not a
+verdict: nothing here explains what the wedge was, and no stack-overflow fault
+was printed either, so "fixed" is not a claim anyone should make. If it returns,
+the stack guard is now armed to name it.
+
+### Build
+
+| | flash | RAM |
+|---|---:|---:|
+| previous (four fixes) | 190,396 | 118,400 |
+| **with promiscuous suspend** | **190,744** | **118,400** |
+
+`arm-none-eabi-size`: 185,312 text / 5,504 data / 111,107 bss. Clean, no
+warnings.

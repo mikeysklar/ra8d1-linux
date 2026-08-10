@@ -256,6 +256,25 @@ void rvt_netbridge_start(void)
 	plat_uart_puts("guest NIC bridged to eth0 (promiscuous)\r\n");
 }
 
+void rvt_netbridge_suspend(void)
+{
+	struct net_if *iface = net_if_get_default();
+
+	if (!nb.up || iface == NULL) {
+		return;
+	}
+	nb.up = false;
+
+	/* The filter thread stays blocked in net_promisc_mode_wait_data()
+	 * forever after this, which is what we want: nothing more arrives, and
+	 * a thread parked on an empty FIFO costs nothing. Taking it down
+	 * properly would need a wakeup path the subsystem does not offer. */
+	(void)net_promisc_mode_off(iface);
+
+	plat_uart_puts("netbridge: promiscuous mode off -- the guest is "
+		       "stopped and every frame was being cloned\r\n");
+}
+
 uint32_t rvt_netbridge_stats(uint32_t *tx, uint32_t *drops)
 {
 	if (tx != NULL) {

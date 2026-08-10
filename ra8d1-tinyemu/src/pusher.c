@@ -70,6 +70,7 @@
 #include <string.h>
 
 #include "image.h"
+#include "netbridge.h"
 #include "pusher.h"
 #include "rv_machine.h"
 #include "rv_platform.h"
@@ -272,6 +273,16 @@ static bool halt_guest(void)
 			us("pusher: guest halted in ");
 			udec((uint32_t)(k_uptime_get() - t0));
 			us(" ms\r\n");
+			/*
+			 * And take promiscuous mode down with it. With the
+			 * guest stopped the bridge has nobody to deliver to,
+			 * but net_if_recv_data() would go on cloning every
+			 * frame the segment carries - 12 of the 32 RX net_bufs
+			 * per full-size frame, 24 with the original - for the
+			 * whole of a push that needs the network to stay
+			 * healthy for a quarter of an hour. See netbridge.h.
+			 */
+			rvt_netbridge_suspend();
 			return true;
 		}
 	} while (k_uptime_get() < deadline);
