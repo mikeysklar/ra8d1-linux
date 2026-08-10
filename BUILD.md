@@ -25,7 +25,7 @@ over telnet. That is the configuration Adafruit Blinka needs.
 | nommu guest + telnet on real silicon | yes, working |
 | **Guest has its own NIC, MAC and DHCP lease** | **yes — virtio-net bridged to eth0, `192.168.2.4` on the LAN (2026-08-09)** |
 | **`ssh root@<guest>` + scp from another machine** | **yes — dropbear, ~9 s first connect, scp -O md5-verified both ways** |
-| **In-app image pusher (no app swap)** | **kernel-sized: yes, proven. 54 MB: open bug, gotcha 27 — use rvlinux for big images** |
+| **In-app image pusher (no app swap)** | **yes, fully — 54 MB pushed, verified, self-rebooted into it (9m29s); gotcha 27 has the story** |
 
 Those were first proven 2026-08-08 on real hardware, unattended: the rootfs ran
 the whole test from `/etc/init.d/S99i2ctest` at boot and the results were read
@@ -722,16 +722,33 @@ Short list. Each of these cost hours.
     RE off → PRM → RE back; the gap is microseconds. If a promiscuous
     toggle is followed by network behavior that makes no sense, this rule
     was violated somewhere.
-27. **OPEN: the in-app pusher cannot yet complete a 54 MB push; kernel-sized
-    pushes are proven.** Five instrumented attempts died at 6.8 MB, 6.0 MB,
-    160 KB (explained: the gotcha-26 violation), and 1,048,576 bytes exactly,
-    the last with promiscuous mode off and no guest running — which refutes
-    promiscuous clone pressure as the sole mechanism. The universal
-    signature: the board consumes every byte the host sent, then both ends
-    sit — the host blocked in `sendall()` until its timeout, the board's
-    30 s no-data poll never firing, no STALLED print. The leading unexplored
-    suspect is Zephyr's TCP receive-window update path (a window that closes
-    under flash-paced draining and never reopens; macOS persist probes would
-    trickle just enough to reset the board's poll). `ra8d1-tinyemu/notes/pusher.md`
-    carries the full evidence table. Until closed: push big images via the
-    rvlinux app (54 MB in ~14.5 min, reliable), and kernels via either.
+27. **CLOSED 2026-08-09/10: the 54 MB push killer was a TCP receive window
+    smaller than one MSS.** Zephyr derives the window as
+    `(NET_BUF_RX_COUNT * NET_BUF_DATA_SIZE) / 3` — with the old 32-buffer
+    pool that was **1365 bytes, 0.93 of one MSS**. Every full segment closed
+    the window; every next segment depended on one window-update ACK;
+    `tcp_update_recv_wnd()` only runs when the app reads *more*, which a
+    drained app cannot — so one lost update was a permanent silent deadlock,
+    rolled ~40,000 times per 54 MB push. The board looked alive because
+    macOS persist probes trickled a byte every 5-60 s, resetting a per-recv
+    30 s poll inside a fill loop that had no overall deadline. Five deaths
+    scattered 6.5x in offset, which is what a per-round-trip lottery looks
+    like. Fixed: `NET_BUF_RX_COUNT=256`, window pinned to 10922 (7.5 MSS,
+    pool 3x the window). Beware the trap inside the fix:
+    `NET_TCP_MAX_RECV_WINDOW_SIZE` REPLACES the derived value rather than
+    capping it — an earlier "cap" of 16384 silently advertised 4x the pool.
+
+    Proven end to end: 54 MB pushed through the in-app pusher, verified,
+    board self-rebooted into the new image, guest took its lease, SSH and
+    Blinka confirmed — 9m29s against a 14m54s model (the gotcha-25 poll fix
+    roughly halves programming time; the two landed together so the split
+    is unmeasured). rvlinux runs the same 1365-byte window; its historical
+    intermittent push failures are consistent with the same mechanism.
+
+    What remains, at the historical rate and by design handled by
+    `pushimage.py --retries 3`: a transient single-block program fault
+    (~1 block in 864 per attempt; different block each time — 125 then
+    467 — so not a marginal cell). Run H's instruments positively
+    eliminated incomplete erase, stale reads, unprogrammed blocks and
+    transport corruption, cornering it to the program operation itself.
+    Next suspects ranked in `ra8d1-tinyemu/notes/pusher.md`.
