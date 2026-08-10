@@ -685,3 +685,42 @@ Short list. Each of these cost hours.
     `--no-deps`, naming the CircuitPython dependencies explicitly; Blinka is
     already in the image. A clean wheelhouse build is not evidence that
     on-target resolution works.
+25. **Polling the Semper's WIP bit too soon after a write corrupts every
+    block, and the stock driver's slow poll may be the old intermittent
+    fault.** WIP asserts when the flash die *starts* the program, not when
+    the OSPI controller queues it. A poll that lands in the gap reads WIP=0,
+    the driver reports done, the caller programs the next 64 bytes on top of
+    an in-flight burst — a prohibited second program to live 16-byte ECC
+    units. Measured at the extremes: a 10 µs poll with no floor corrupted
+    **864 of 864 blocks** of a 54 MB push; the stock tick-rounded 100 µs
+    sleep has the same race with a ~100x smaller window, which is a plausible
+    mechanism for the historical ~25%-per-attempt single-block verify miss.
+    Fix in the fork (`122c70fe591`): a 150 µs busy floor before the first
+    status read — below any real completion, above any issue latency. The
+    same commit series doubles write throughput (71 → 146 KB/s measured) by
+    busy-polling programs instead of paying the tick quantum, and doubles
+    the 1.8x erase-timeout margin. Note `PAGE_SIZE_BYTE 64` is the
+    *hardware's* combination-write ceiling (`OSPI_B_COMBINATION_FUNCTION_64BYTE`
+    is the largest enum value) — bigger pages need the FSP's DMAC path,
+    which the Zephyr driver does not wire up. Fork issue #11 has the trail.
+26. **Never write `ECMR.PRM` (or any ETHERC config bit) with the receiver
+    enabled.** The FSP only touches PRM inside link configuration, before
+    RE/TE go on. A live 1→0 flip left the MAC receiving at a crawl — too
+    slow to make progress, too alive for any timeout to name it — for the
+    rest of the session. The fork's `set_config` (`d6346d5dd3a`) sequences
+    RE off → PRM → RE back; the gap is microseconds. If a promiscuous
+    toggle is followed by network behavior that makes no sense, this rule
+    was violated somewhere.
+27. **OPEN: the in-app pusher cannot yet complete a 54 MB push; kernel-sized
+    pushes are proven.** Five instrumented attempts died at 6.8 MB, 6.0 MB,
+    160 KB (explained: the gotcha-26 violation), and 1,048,576 bytes exactly,
+    the last with promiscuous mode off and no guest running — which refutes
+    promiscuous clone pressure as the sole mechanism. The universal
+    signature: the board consumes every byte the host sent, then both ends
+    sit — the host blocked in `sendall()` until its timeout, the board's
+    30 s no-data poll never firing, no STALLED print. The leading unexplored
+    suspect is Zephyr's TCP receive-window update path (a window that closes
+    under flash-paced draining and never reopens; macOS persist probes would
+    trickle just enough to reset the board's poll). `ra8d1-tinyemu/notes/pusher.md`
+    carries the full evidence table. Until closed: push big images via the
+    rvlinux app (54 MB in ~14.5 min, reliable), and kernels via either.
