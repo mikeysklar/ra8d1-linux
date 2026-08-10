@@ -9,31 +9,41 @@ guides say it does.
 **The short version.** Your CircuitPython code is unchanged — `import board`,
 `busio.I2C(board.SCL, board.SDA)`, and a scan returns `['0x14']`, exactly as on
 a Pi. What changes is everything around the code: it is ~19x slower to start,
-the filesystem is read-only, there is no network, and there is no SPI.
+the filesystem is read-only, and there is no SPI. (Since 2026-08-09 there IS
+a network — the guest has its own NIC and DHCP lease; see §1 and §3.)
 
 ---
 
 ## 1. Getting a prompt
 
-There is no HDMI, no keyboard, no `ssh`. Two ways in, both giving a root shell
-with no password:
+There is no HDMI and no keyboard. Three ways in, all giving a root shell with
+no password:
 
 ```sh
 # serial: the J-Link's VCOM, same USB cable as the debugger
 screen /dev/cu.usbmodem0010868598391 921600
 
-# telnet: needs the networking build of the app flashed
+# telnet: the host app relays the guest console over TCP
 telnet 192.168.2.3
+
+# ssh: the guest itself, on its OWN address - it takes its own DHCP lease
+ssh root@192.168.2.4        # first connect ~9 s; the handshake is the cost
+scp -O file root@192.168.2.4:/tmp/   # -O matters; no sftp-server on board
 ```
 
-Note **921600**, not the 115200 you may expect. The two consoles are the same
-console — the guest's output follows whichever one is attached — so a telnet
-client left connected silently steals the serial console. Only one telnet
-client at a time.
+Note **921600** on serial, not the 115200 you may expect. Serial and telnet
+are the same console — the guest's output follows whichever is attached — so
+a telnet client left connected silently steals the serial console. SSH is
+different in kind: the guest has a virtio-net NIC bridged onto the real
+Ethernet (added 2026-08-09, see `ra8d1-linux/notes/guest-net.md` and
+`ssh.md`), its own MAC (the board's with the local bit set and last byte
+inverted), and its own lease — so ssh sessions are real network logins with
+job control, and several can run at once. The board's address (.3) and the
+guest's (.4) are different hosts on the LAN.
 
-`ssh` does not exist. It needs an IP stack *inside* the guest, and telnet here
-is a host-side relay that the guest sees as a plain UART. See `dropbear` in
-`ra8d1-linux/notes/08-guest-net-mmu.md` for what SSH would take.
+Two ssh caveats. Login is root with NO credential at all on this image —
+fine behind Internet Sharing, not fine on a real network; `ssh.md` §4 has
+the two-line fix. And there is no sftp-server, so modern scp needs `-O`.
 
 ## 2. Speed: the one thing that will surprise you
 
@@ -64,9 +74,13 @@ itself and PlatformDetect reads it, so stock examples run unmodified.
 
 ## 3. Installing libraries
 
-`pip` works, and so does `venv`. What does not exist is **the network**, so
-every install is offline, out of the wheelhouse baked into the image at
-`/opt/wheels`. All of the below is verified on hardware.
+`pip` works, and so does `venv`. The offline wheelhouse baked into the image
+at `/opt/wheels` is the reliable path and everything below is verified on
+hardware against it. As of 2026-08-09 the guest also has a real network with
+NAT to the internet through the Mac, so `pip install` straight from PyPI is
+plausible — TLS at 15 MIPS will make it slow, and it is NOT yet verified;
+the wheelhouse guidance stands either way, and `--no-deps` doubly so online,
+because PyPI resolution will hit the `sysv_ipc` wall below head-on.
 
 **`--no-deps` is mandatory, and this is the big one.**
 
