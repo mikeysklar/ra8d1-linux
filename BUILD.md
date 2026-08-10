@@ -23,6 +23,9 @@ over telnet. That is the configuration Adafruit Blinka needs.
 | **`i2cdetect -y -r 0` against real silicon** | **yes — finds the device at `0x14`** |
 | **Blinka on the board, full auto-detection** | **yes — `chip=RA8D1_PV board=EK_RA8D1_RVLINUX`, `board.I2C()` scan returns `['0x14']`** |
 | nommu guest + telnet on real silicon | yes, working |
+| **Guest has its own NIC, MAC and DHCP lease** | **yes — virtio-net bridged to eth0, `192.168.2.4` on the LAN (2026-08-09)** |
+| **`ssh root@<guest>` + scp from another machine** | **yes — dropbear, ~9 s first connect, scp -O md5-verified both ways** |
+| **In-app image pusher (no app swap)** | **kernel-sized: yes, proven. 54 MB: open bug, gotcha 27 — use rvlinux for big images** |
 
 Those were first proven 2026-08-08 on real hardware, unattended: the rootfs ran
 the whole test from `/etc/init.d/S99i2ctest` at boot and the results were read
@@ -118,17 +121,25 @@ positives, which is the failure mode trap 10 warns about. `PV_I2C_WLEN` is still
 written on the probe path — the host keeps it in a register the guest owns and
 no command clears, so skipping it would reuse the previous transfer's length.
 
-### Known-broken upstream drivers (filed, not fixed)
+### Upstream driver problems, now fixed in the fork (2026-08-09)
 
-Neither blocks the build; both cost real time if you hit them unaware.
+Both issues below are FIXED on the fork's `ra8d1/glcdc-64byte-alignment`
+branch; the issue numbers carry the investigation trail.
 
-- **mikeysklar/zephyr#10** — `eth_renesas_ra.c` has no `.set_config`, so
-  promiscuous mode is unreachable and `CONFIG_NET_ETHERNET_BRIDGE` cannot bind
-  the interface. Blocks guest networking via a bridge. ~12 line fix.
-- **mikeysklar/zephyr#11** — `flash_renesas_ra_ospi_b.h` hardcodes
-  `PAGE_SIZE_BYTE 64`; the S28HL512T page buffer is 256 or 512. Costs 4-8x on
-  every flash write, and may contribute to the intermittent verify failure
-  described under "A rootfs push can fail verification".
+- **mikeysklar/zephyr#10** — `eth_renesas_ra.c` had no `.set_config`, so
+  promiscuous mode was unreachable. Fixed in `8ca5eb88530` (capability +
+  handler, durable across re-link) and hardened in `d6346d5dd3a` (PRM is
+  only written with the receiver disabled — gotcha 26). Upstream still has
+  neither. The fork also carries upstream PR #115734's TX/RX robustness
+  fixes as `1b5f1c41b1d`.
+- **mikeysklar/zephyr#11** — `PAGE_SIZE_BYTE 64` turned out to be the
+  *hardware's* combination-write ceiling, not a sloppy constant (the issue
+  thread has the correction); bigger pages need the FSP DMAC path. The real
+  costs were elsewhere and are fixed in `d6346d5dd3a` + `122c70fe591`:
+  tick-quantized status polling (write rate 71 → 146 KB/s), a 1.8x erase
+  timeout margin (doubled), and — the big one — the WIP-assertion race of
+  gotcha 25, which is the leading explanation for the historical
+  intermittent verify miss.
 
 ## 0. Hardware
 
