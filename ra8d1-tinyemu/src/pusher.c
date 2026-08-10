@@ -808,6 +808,14 @@ static int nl_send_banner(int s)
  *
  * Returns bytes read, 0 on timeout, -1 on error or orderly close.
  */
+/* Filled on every nl_recv() failure so the "rx error" report can say WHICH
+ * error. Run G of the 54 MB bug hunt died on a bare "rx error" with the
+ * stall instrument silent - a hard stack error, identity unknown, which is
+ * one word away from being diagnosable. Never again. */
+static int nl_rx_err_errno;
+static short nl_rx_err_revents;
+static int nl_rx_err_ret;
+
 static int nl_recv(int s, uint8_t *p, size_t n, int timeout_s)
 {
 	struct zsock_pollfd pfd = { .fd = s, .events = ZSOCK_POLLIN };
@@ -819,11 +827,20 @@ static int nl_recv(int s, uint8_t *p, size_t n, int timeout_s)
 	}
 	if (pr < 0 || (pfd.revents & (ZSOCK_POLLERR | ZSOCK_POLLHUP |
 				      ZSOCK_POLLNVAL))) {
+		nl_rx_err_errno = errno;
+		nl_rx_err_revents = pfd.revents;
+		nl_rx_err_ret = pr;
 		return -1;
 	}
 
 	got = zsock_recv(s, p, n, 0);
-	return got > 0 ? (int)got : -1;
+	if (got <= 0) {
+		nl_rx_err_errno = errno;
+		nl_rx_err_revents = pfd.revents;
+		nl_rx_err_ret = (int)got;
+		return -1;
+	}
+	return (int)got;
 }
 
 /* Read exactly n bytes, or fail. Used for the fixed-size header only. */
@@ -1102,8 +1119,22 @@ static int nl_push(int s)
 						  CONFIG_RVT_PUSHER_RX_TIMEOUT_S);
 
 				if (got <= 0) {
-					us(got == 0 ? "pusher: rx timeout\r\n"
-						    : "pusher: rx error\r\n");
+					if (got == 0) {
+						us("pusher: rx timeout\r\n");
+					} else {
+						us("pusher: rx error, errno ");
+						udec((uint32_t)nl_rx_err_errno);
+						us(" revents 0x");
+						uhex((uint32_t)(uint16_t)nl_rx_err_revents);
+						us(" ret ");
+						if (nl_rx_err_ret < 0) {
+							us("-");
+							udec((uint32_t)-nl_rx_err_ret);
+						} else {
+							udec((uint32_t)nl_rx_err_ret);
+						}
+						us("\r\n");
+					}
 					failed = true;
 					break;
 				}
