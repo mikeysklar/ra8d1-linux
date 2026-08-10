@@ -1,0 +1,72 @@
+# Buildroot fragment: on-target Python packaging for the MMU guest.
+#
+# Merge into the MMU rootfs config (the qemu_riscv32_virt_defconfig-derived
+# tree at /br/mmu), not the nommu one. Symbols below were checked against the
+# Buildroot tree in the `br` container; do not add symbols without doing the
+# same, because a misspelled BR2_ symbol is silently ignored and the package
+# just never appears.
+
+# pip and setuptools on the target. Verified present as Buildroot packages:
+#   package/python-pip/Config.in         -> config BR2_PACKAGE_PYTHON_PIP
+#   package/python-setuptools/Config.in  -> config BR2_PACKAGE_PYTHON_SETUPTOOLS
+BR2_PACKAGE_PYTHON_PIP=y
+BR2_PACKAGE_PYTHON_SETUPTOOLS=y
+
+# There is NO package/python-wheel in Buildroot. Do not add
+# BR2_PACKAGE_PYTHON_WHEEL - it does not exist and will be ignored. Ship wheels
+# prebuilt in the wheelhouse instead (make-wheelhouse.sh); nothing on the guest
+# needs to *build* a wheel, and it could not anyway (no compiler on target).
+
+# Keep the sources for anything pip installs. The rest of the stdlib stays
+# .pyc-only via the existing PYC_ONLY setting: a read-only root cannot write
+# __pycache__, so shipping .py without .pyc would mean recompiling on every
+# import, and CPython startup already costs 7.3 s at 15.37 MIPS.
+
+# --------------------------------------------------------------------------
+# venv DOES work, contrary to what python3.mk suggests.
+#
+# package/python3/python3.mk passes --without-ensurepip (lines 20 and 181), so
+# the obvious reading is that `python3 -m venv` cannot bootstrap pip. Measured
+# on the target, that reading is WRONG: /usr/lib/python3.11/ensurepip/_bundled
+# ships pip-23.2.1 and setuptools-65.5.0 wheels, and both
+# `python3 -m venv --system-site-packages /tmp/env` and the resulting
+# `/tmp/env/bin/pip --version` were verified working under QEMU on this exact
+# image. Trust the target, not the .mk.
+#
+# --system-site-packages is MANDATORY on any venv here: Blinka, PlatformDetect
+# and PureIO live in the read-only /usr/lib/python3.11/site-packages, a plain
+# venv hides them, and they cannot be reinstalled - see the sysv_ipc note below.
+#
+# --------------------------------------------------------------------------
+# STDLIB MODULES pip NEEDS that Buildroot's trimmed target does not ship.
+#
+# Copy these from output/target/usr/lib/python3.11/ into the rootfs or pip
+# fails in ways that name the wrong culprit:
+#
+#   http       pip's vendored urllib3 -> http.client
+#   xmlrpc     pip's vendored distlib.compat -> xmlrpc.client
+#   distutils  setuptools / scheme paths
+#
+# xmlrpc is the nastiest. pip 26 eagerly imports
+# pip._internal.operations.install.wheel and, when that fails, records it in
+# _MISSING_MODULES and raises from an audit hook later - so the error you see is
+# "No module named 'pip._internal.operations.install.wheel'" and the real cause
+# (xmlrpc) appears nowhere. Import the module directly to get the true
+# traceback:
+#     python3 -c "import pip._internal.operations.install.wheel"
+#
+# The cheapest fix is to sync every entry the buildroot target has that the
+# rootfs lacks, rather than chasing one module per build-push cycle.
+#
+# --------------------------------------------------------------------------
+# sysv_ipc: why every install needs --no-deps.
+#
+# adafruit-blinka depends on sysv_ipc under `sys_platform == "linux"`, and no
+# riscv32 wheel for it has ever been published. Any pip resolution that reaches
+# adafruit-blinka therefore fails on-target. Blinka is already in the image, so
+# install drivers with --no-deps and name the CircuitPython deps explicitly.
+#
+# Trap when building the wheelhouse on a Mac: that marker is FALSE on darwin, so
+# `pip download` never asks for sysv_ipc and every wheel looks pure. The
+# wheelhouse is fine; it is the on-target resolution that fails. Do not read a
+# clean wheelhouse build as evidence that installs will resolve on the guest.

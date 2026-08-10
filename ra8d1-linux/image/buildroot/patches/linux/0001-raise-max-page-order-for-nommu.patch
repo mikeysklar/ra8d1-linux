@@ -1,0 +1,30 @@
+Raise MAX_PAGE_ORDER from 10 to 13 for the rv32 nommu target.
+
+On nommu every process needs one physically *contiguous* allocation for its
+whole text+data+bss+stack, so the largest block the buddy allocator can hand
+out is a hard ceiling on binary size. The default MAX_PAGE_ORDER of 10 caps
+that at 2^10 pages = 4 MiB, which is why this image hits an allocation cliff
+long before it runs out of free memory (measured: fails at 10 MiB RAM with
+3,432 kB still free but the largest free block only 512 kB).
+
+riscv, unlike arm/arm64/powerpc, never defines CONFIG_ARCH_FORCE_MAX_ORDER in
+its Kconfig, so there is no config symbol to set -- the constant has to be
+changed at the source. This is the same change cnlohr's mini-rv32ima README
+calls for ("You *MUST* build your kernel with MAX_ORDER set to >12 ... if you
+are building your own image"), updated for the 6.8 rename of MAX_ORDER to
+MAX_PAGE_ORDER.
+
+13 gives a 32 MiB maximum block, which is the whole point: a statically linked
+interpreter is several MiB of one contiguous region under bFLT.
+
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -27,7 +27,7 @@
+ 
+ /* Free memory management - zoned buddy allocator.  */
+ #ifndef CONFIG_ARCH_FORCE_MAX_ORDER
+-#define MAX_PAGE_ORDER 10
++#define MAX_PAGE_ORDER 13
+ #else
+ #define MAX_PAGE_ORDER CONFIG_ARCH_FORCE_MAX_ORDER
+ #endif

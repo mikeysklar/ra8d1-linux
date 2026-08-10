@@ -1,0 +1,44 @@
+# BusyBox config fragment merged on top of cnlohr's busybox_config.
+# Priority 1 of the task: telnetd for automated remote login.
+
+CONFIG_TELNETD=y
+CONFIG_FEATURE_TELNETD_STANDALONE=y
+CONFIG_FEATURE_TELNETD_INETD_WAIT=y
+CONFIG_TELNET=y
+CONFIG_FEATURE_TELNET_TTYPE=y
+CONFIG_FEATURE_TELNET_AUTOLOGIN=y
+CONFIG_FEATURE_TELNET_WIDTH=y
+
+# telnetd -l needs a login path; keep both so we can test with and without auth
+CONFIG_LOGIN=y
+CONFIG_FEATURE_NOLOGIN=y
+
+# minimum to bring an interface up and route
+CONFIG_IFCONFIG=y
+CONFIG_FEATURE_IFCONFIG_STATUS=y
+CONFIG_FEATURE_IFCONFIG_SLIP=y
+CONFIG_FEATURE_IFCONFIG_HW=y
+CONFIG_FEATURE_IFCONFIG_BROADCAST_PLUS=y
+CONFIG_ROUTE=y
+CONFIG_IP=y
+CONFIG_FEATURE_IP_ADDRESS=y
+CONFIG_FEATURE_IP_LINK=y
+CONFIG_FEATURE_IP_ROUTE=y
+CONFIG_FEATURE_IP_ROUTE_DIR="/etc/iproute2"
+CONFIG_PING=y
+CONFIG_NETSTAT=y
+CONFIG_FEATURE_NETSTAT_WIDE=y
+CONFIG_ARP=y
+CONFIG_NC=y
+CONFIG_HOSTNAME=y
+
+# SLIP attach, in case that is the transport we pick
+CONFIG_SLATTACH=y
+
+# DHCP client, cheap and useful if the host side offers it
+CONFIG_UDHCPC=y
+CONFIG_UDHCPC_DEFAULT_SCRIPT="/usr/share/udhcpc/default.script"
+
+# vi is genuinely useful when debugging over telnet and costs ~20 KB
+CONFIG_VI=y
+CONFIG_FEATURE_VI_MAX_LEN=4096

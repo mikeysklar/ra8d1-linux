@@ -1,0 +1,56 @@
+# Kernel config fragment merged on top of cnlohr's custom_kernel_config.
+# Goal: TCP/IP + at least one net device, and a bigger max contiguous block
+# for nommu (every process needs one physically contiguous allocation).
+
+# --- core networking ---
+CONFIG_NET=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IP_PNP=y
+CONFIG_IP_PNP_DHCP=y
+CONFIG_IP_PNP_BOOTP=y
+# IPv6 costs size and buys us nothing here
+# CONFIG_IPV6 is not set
+# CONFIG_WIRELESS is not set
+# CONFIG_NETFILTER is not set
+# CONFIG_BRIDGE is not set
+# CONFIG_VLAN_8021Q is not set
+
+# --- network devices: enable BOTH candidate transports ---
+CONFIG_NETDEVICES=y
+CONFIG_NET_CORE=y
+
+# virtio-net (needs CONFIG_VIRTIO_MMIO, already on in the base config)
+CONFIG_VIRTIO_NET=y
+
+# SLIP over a second emulated UART
+CONFIG_SLIP=y
+CONFIG_SLHC=y
+CONFIG_SLIP_COMPRESSED=y
+CONFIG_SLIP_SMART=y
+# CONFIG_SLIP_MODE_SLIP6 is not set
+
+# TUN is handy for a userspace-driven transport and is small
+CONFIG_TUN=y
+
+# no PHY/ethernet driver zoo, no dummy
+# CONFIG_ETHERNET is not set
+# CONFIG_PHYLIB is not set
+# CONFIG_WLAN is not set
+# CONFIG_PPP is not set
+
+# --- second 8250 port so SLIP has somewhere to live ---
+CONFIG_SERIAL_8250_NR_UARTS=2
+CONFIG_SERIAL_8250_RUNTIME_UARTS=2
+
+# --- nommu contiguity ---
+# NOTE: there is deliberately no CONFIG_ARCH_FORCE_MAX_ORDER here. arch/riscv
+# never defines that symbol (checked against v6.8-rc1: arm64/arm/powerpc do,
+# riscv does not), so setting it in a fragment is silently dropped by
+# olddefconfig and looks like it worked. The limit is raised by
+# patches/linux/0001-raise-max-page-order-for-nommu.patch instead, which edits
+# the MAX_PAGE_ORDER fallback in include/linux/mmzone.h.
+
+# report fragmentation on allocation failure, which is the failure mode here
+CONFIG_MAGIC_SYSRQ=y

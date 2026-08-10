@@ -1,0 +1,26 @@
+# /etc/inittab -- based on cnlohr's mini-rv32ima overlay, plus network bring-up.
+#
+# Format: <id>:<runlevels>:<action>:<process>   (BusyBox init ignores runlevels)
+
+::sysinit:/bin/mkdir -p /run/lock/subsys /dev/shm /dev/pts
+::sysinit:/bin/mount -a
+::sysinit:/bin/hostname -F /etc/hostname
+::sysinit:/etc/init.d/rc.net
+
+console::sysinit:echo "Welcome to mini-rv32ima Linux"
+
+# A normal interactive shell, with line editing, history and job control.
+#
+# This was replaced for a while by /sbin/conloop, a canonical-mode read/eval
+# loop, because interactive ash appeared to be broken on the console: you could
+# log in, and then nothing you typed produced any output ever again. That was
+# never the shell's fault. The console lost most of its input because the
+# Zephyr host polled the UART once per emulator slice, and a command line that
+# loses its newline leaves the shell blocked in read() forever. Fixed host-side
+# with CONFIG_UART_INTERRUPT_DRIVEN; see BUILD.md gotcha 17.
+#
+# conloop is gone rather than kept as a fallback: it also read without -r, so
+# it silently ate backslashes and corrupted anything containing an escape.
+console::respawn:/bin/login -f root
+
+::shutdown:/bin/umount -a -r

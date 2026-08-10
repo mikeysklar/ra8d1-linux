@@ -15,8 +15,16 @@ build-*/
 *.ext2
 *.uf2
 *.img
-Image
-Image-*
+# Kernel images anywhere. CAUTION, learned the expensive way: macOS git
+# matches ignores case-insensitively (core.ignorecase=true), so a bare
+# `Image` pattern also swallowed the entire ra8d1-linux/image/ DIRECTORY -
+# every Buildroot recipe, config fragment and overlay silently never made it
+# into the repo. The negation below re-includes the directory itself (last
+# match wins; the trailing slash means it applies to the dir, not children),
+# while Image* files inside stay ignored.
+**/Image
+**/Image-*
+!ra8d1-linux/image/
 rootfs
 rootfs-*
 *.zip
