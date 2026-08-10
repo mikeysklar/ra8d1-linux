@@ -643,3 +643,142 @@ Read the console, not the tool. The lines that decide it, in order:
 - Dies → the rootfs slot address is the variable, not the size.
 - Dies **before** `first flash_write returned` → nothing to do with the write
   path at all, and the erase aftermath is the whole story.
+
+---
+
+## 2026-08-09: the instrumented 54 MB run. The board was never the problem.
+
+The board did not wedge. It stayed alive, printed continuously, and ended with
+its own diagnostics. Whether the earlier lockup was perturbed away or is simply
+intermittent is **unknown and should stay unknown** until it recurs.
+
+Everything below is read off
+`scratchpad/push54-serial.log` and `scratchpad/push54.log`.
+
+### There is no gap in the progress output
+
+The reading that there were no 3/4/5/6 MB lines is a misread of the log. They
+are all there, consecutive:
+
+```
+pusher: 1 MB at flash 0x00941000
+pusher: 2 MB at flash 0x00a41000
+pusher: 3 MB at flash 0x00b41000
+pusher: 4 MB at flash 0x00c41000
+pusher: 5 MB at flash 0x00d41000
+pusher: 6 MB at flash 0x00e41000
+pusher: rx error
+pusher: transfer died at payload offset 6848512 of 56623104, flash 0x00ec9000
+```
+
+And the arithmetic closes exactly. Last print is payload offset 6,291,456
+(0x00e41000 - 0x841000). Death is at 6,848,512 = 0x00ec9000 - 0x841000, which
+is **557,056 bytes = 68 buffers later** — precisely what 1 MB granularity
+predicts, since the next mark was not due until 7 MB. 6,848,512 is also
+836 x 8192 exactly, so every buffer was full and no handoff was short.
+
+The instrumentation did its job and there is nothing anomalous to explain in it.
+
+### No wait in the pusher lacks a print, and the two prints that did NOT appear are the finding
+
+Every blocking wait on the producer path is bounded and reports:
+
+| wait | bound | prints |
+|---|---|---|
+| `k_sem_take(&nl_free, ...)` | 15 s | `pusher: STALLED, ...` |
+| `nl_recv()` → `zsock_poll()` | 30 s | `pusher: rx timeout` |
+| `zsock_recv()` | `SO_RCVTIMEO` 30 s | `pusher: rx error` |
+
+**Neither `STALLED` nor `rx timeout` appeared.** So the flash writer was never
+more than 15 seconds late with a buffer, and the board was never starved of
+data for 30 seconds. What did appear is `rx error`, which is `nl_recv()`
+returning -1: `zsock_poll()` reported ERR/HUP/NVAL, or `zsock_recv()` returned
+zero or less. An orderly close and an RST both land there.
+
+That is the host hanging up. The board was the victim of this failure, not the
+cause of it.
+
+### The tool log shows a healthy link running at exactly the flash write rate
+
+The progress bar has two regimes, and reading them apart is the whole story:
+
+```
+ 0.62/54.00 MB  elapsed 6s
+ 4.56/54.00 MB  elapsed 8s     <- +3.94 MB in 2 seconds
+ ...
+ 6.50/54.00 MB  elapsed 36s
+```
+
+The jump is ~4 MB disappearing into socket buffers at wire speed. Everything
+after it is honest: **4.56 MB to 6.50 MB in 28 s is 70.9 KB/s**, and the
+measured flash write rate on this board is ~71 KB/s. From the moment the
+buffers filled, the sender was paced precisely by the flash.
+
+`pushimage.py` says so itself, in a comment: progress is "bytes accepted by the
+socket, not bytes committed to flash." The kernel push showed the same gap and
+the same rate — socket took 6.5 MB in 34 s, then 57 s of drain, which is
+6.5 MB / 91 s = 71 KB/s.
+
+### Whose clock is lying: neither
+
+The board consumed **6,848,512 bytes, which is 32,768 MORE than the tool's last
+printed 6.50 MB (6,815,744)**. The board therefore received everything the host
+had handed to TCP *and* half of the 64 KB chunk the tool was blocked inside.
+The host's send buffer was drained. There is no missing data and no
+disagreement — the two numbers count different things and both are right.
+
+### What actually failed: the host's own socket timeout, applied to send
+
+`pushimage.py`'s `TcpBoard.__init__` does `self.s.settimeout(rx_timeout)`, and
+in Python a socket timeout applies to `sendall()` as well as `recv()`.
+CPython's `sock_sendall()` sets **one deadline for the entire call**. So
+`--rx-timeout` is really "how long the host tolerates being flow-controlled",
+and this link is *designed* to be slower than the sender.
+
+**At 71 KB/s a 54 MB payload is 13.0 minutes of pure flash time**, on top of a
+2m53s erase — a 16 minute operation. Any per-`sendall` timeout below that is a
+gamble on how long the board's TCP window stays shut at the tail.
+
+The one thing not provable from here: why a single 64 KB `sendall` failed to
+complete in 120 s when the link had been moving 71 KB/s. The shape — the board
+stopping at an exact buffer boundary having consumed everything available — is
+what a zero-window stall looks like from the application's side, i.e. the
+window closed and the reopen was not prompt. Stated as the shape of the
+evidence, not as a diagnosis.
+
+### Prediction for run 2 (`--rx-timeout 300`), written before the data
+
+- Dies at an offset **substantially larger** than 6,848,512 (say past 12 MB) →
+  the pause is finite and the host timeout was the entire story. Raise it and
+  the push completes.
+- Dies at a **similar** offset → the stall is not a pause but a deadlock, and
+  more timeout will never fix it.
+- Completes in ~16 minutes → same conclusion as the first case, with the image
+  landed.
+
+### What to do, cheapest first
+
+1. **`--rx-timeout 600` for rootfs pushes.** A 54 MB push is a 16 minute
+   operation; the tool has to be told to be patient. Zero code.
+2. **Reconsider the receive window cap.** The evidence that condemned
+   `CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE=16384` no longer decides anything: the
+   "stalled at 0.06 MB" it was blamed for is what an *honestly paced* progress
+   bar looks like in the first second, once the host is no longer allowed to
+   buffer 4 MB ahead — 0.06 MB is roughly one second of flash at 71 KB/s. The
+   other half of that verdict was the board wedge, which this run did not
+   reproduce. A cap around 64 KB is worth one more measurement; it keeps the
+   sender paced and stops the tail-end window games.
+3. **The real fix is throughput, and it is already a known bug.**
+   `PAGE_SIZE_BYTE=64` in `flash_renesas_ra_ospi_b.h` against a 256- or
+   512-byte page buffer (mikeysklar/zephyr#11) is what makes this 71 KB/s
+   instead of 4-8x that. Fixed, a 54 MB push goes from 13 minutes to about 3,
+   and this entire class of timeout problem stops existing. It is a
+   one-constant fork patch and it is worth more than any amount of tuning here.
+
+### Also measured: the incremental blank check is 20x faster
+
+`blank check ok, 965 ms over 217 blocks` — 4.4 ms per 256 KB block, 965 ms for
+54 MB. The previous monolithic version accounted for roughly 19 s of the old
+3m15s erase. Erase is now 2m53s for the same 217 blocks. The cost was never the
+reading; it was the single `sys_cache_data_invd_range()` of 1.78 million
+cache-line operations.
