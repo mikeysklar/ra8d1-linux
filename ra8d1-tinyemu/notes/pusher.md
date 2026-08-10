@@ -388,3 +388,258 @@ watchdog, if one is enabled by default.
   It did the same image in 14m21s the same day, before and after this attempt.
 
 That is a smaller win than "gotcha 14 is dead", and it is the win that exists.
+
+---
+
+## 2026-08-09, later: code analysis of the 54 MB hang
+
+No hardware, no builds. Read of the app, the RA OSPI-B driver and the generated
+config. Three of the four suspects die here; the fourth is reframed.
+
+### The premise in the section above is wrong, and it changes what to test
+
+"The variable that scales is total programming time: ~12 minutes vs ~30
+seconds" is contradicted by the measurement next to it. **The board died at
+0.06 MB of 54 MB** — about seven 8 KB buffers, a few seconds into the payload.
+It never reached twelve minutes of programming, or one minute.
+
+And the payload write path is *proven good at that scale*: the kernel push
+wrote 6.5 MB — ~800 buffers, ~100,000 page programs, ~80 s of continuous
+programming — and only stopped because the host timed out at 99.6%.
+
+So the thing that differs is not the payload phase. It is what immediately
+precedes it. Per push:
+
+| | kernel | rootfs | ratio |
+|---|---:|---:|---:|
+| erase blocks | 26 | 217 | 8.3x |
+| erase wall time | 21 s | 3m15s | 9.3x |
+| blank-check reads through the OSPI window | 6.8 MB | 56.9 MB | 8.3x |
+| `sys_cache_data_invd_range` line ops | 212,992 | 1,777,664 | 8.3x |
+| payload buffers actually written | ~800 | **~7** | — |
+
+### It is a fault or a lockup, not a deadlock or starvation
+
+Every wait on the push path is bounded, and each one prints:
+
+- `k_sem_take(&nl_free, K_MSEC(15000))` → `pusher: STALLED, ...`
+- `nl_recv()` → `zsock_poll(..., 30 s)` → `pusher: rx timeout` then
+  `pusher: transfer died at payload offset N of M`
+
+So a board that was merely stuck, starved or flow-controlled had to print
+something within 30 seconds. It printed nothing, answered no ping, and came
+back only on reset. That is the signature of an escalated HardFault (ARM
+LOCKUP), and `CONFIG_HW_STACK_PROTECTION` is **not set** in this build, so a
+stack overflow would also be silent rather than caught.
+
+### Suspects (b), (c) and (d): dead, from the code
+
+**(c) Watchdog — dead.** `# CONFIG_WATCHDOG is not set`,
+`# CONFIG_TASK_WDT is not set`. There is nothing to starve.
+
+**(b) Driver spinning with interrupts masked — not supported.**
+`flash_renesas_ra_ospi_b_wait_operation()` is:
+
+```c
+while (status.write_in_progress) {
+        R_OSPI_B_StatusGet(p_ctrl, &status);
+        if (timeout == RESET_VALUE) { return -EIO; }
+        k_sleep(K_USEC(50));
+        timeout--;
+}
+```
+
+It **sleeps**. At `CONFIG_SYS_CLOCK_TICKS_PER_SEC=10000` each iteration yields
+for at least one 100 us tick, so the writer thread hands the CPU to every other
+thread on the board roughly ten thousand times a second for the whole push.
+There is no `irq_lock()` and no busy-wait anywhere on the erase or write path.
+Both operations are bounded and return `-EIO`, which this app reports on the
+console — so a driver hang would have produced a line, not silence.
+
+Worth recording while we are here: **the erase timeout margin is thin.**
+`TIME_ERASE_256K` is 16000 iterations ≈ 1.6 s of budget, against a measured
+899 ms per 256 KB block. Under 2x. Not the cause of this failure — the erase
+completed — but it is the kind of margin that turns into an intermittent
+`erase failed` on a hot or aging part.
+
+**(d) Something in the double-buffer handoff after N iterations — dead.** There
+is no per-iteration state but `i ^= 1` and two semaphores; nothing counts,
+nothing wraps. And the evidence kills it independently: it died at ~7 handoffs
+having survived ~800 the push before.
+
+### Suspect (a): not supported from software, but not fully closable
+
+`plat_slot_base()` has exactly six call sites — one in `main.c`'s boot check,
+five in `pusher.c` (`img_check`, `img_diagnose`, the blank check, `img_commit`,
+`nl_send_blkcrc`). **None of them can run while the writer is programming:**
+the blank check finishes before `OK erased` goes out, and commit/blkcrc run
+only after `k_thread_join()` has returned. The `img->rootfs` pointer the
+machine layer holds is dereferenced only by the emulator, which is halted — and
+the kernel push proves the halt works, because the board rebooted into the
+image it had just been given.
+
+So no *code path* in this application reads the window during programming.
+
+What software cannot rule out: the OSPI window is Normal cacheable memory to
+the MPU, and Armv8-M permits the core to make speculative reads there without
+any instruction dereferencing a pointer. `R_OSPI_B_StatusGet()` uses a direct
+transfer, which takes the controller out of memory-mapped mode, and the poll
+loop above does that every ~100 us for the entire erase and the entire push. A
+speculative read landing in one of those windows is a bus error the code cannot
+prevent or see. **But that mechanism is equally live during a kernel push**,
+which survives, so on its own it does not explain the split.
+
+### Best-supported reading, and the confidence I have in it
+
+A fault, taken at or just after the erase→payload transition, on a push whose
+erase phase was 8x larger than the one that works. **I cannot name the faulting
+access from the code, and I am not going to pretend otherwise — call it
+moderate confidence in the *class* of failure and low confidence in any single
+mechanism.** The useful output of this analysis is that it eliminates three
+suspects and moves the search from the payload phase, where it was pointed, to
+the erase and blank-check phase, where the 8x actually is.
+
+### One decisive experiment, then a second
+
+Both are Kconfig or argument changes only. No code change, no rebuild of the
+push path logic.
+
+**Test 1 — push a ~10 MB file to the *rootfs* slot.** Same slot, same start
+address 0x841000, same write path; a 40-block/~35 s erase instead of
+217-block/3m15s.
+
+- Survives → the **erase length** (or the blank check that scales with it) is
+  the variable. Slot address and write path are exonerated. Go to test 2.
+- Dies → the **rootfs slot address** is the variable, not the size. That points
+  at the region the guest had been reading in place, and makes the speculative
+  variant of (a) the live hypothesis.
+
+**Test 2 — `CONFIG_RVT_PUSHER_BLANK_CHECK=n`, push the 54 MB rootfs.**
+
+- Survives → the blank check is implicated: 56.9 MB of memory-mapped reads plus
+  a single `sys_cache_data_invd_range()` over 56,885,248 bytes, which is 1.78
+  million cache-line operations in one unbroken loop. That is this app's code
+  and this app's bug to fix.
+- Dies → the erase itself is implicated, and it is a driver or silicon matter
+  rather than an application one.
+
+Test 1 first: it is the cheaper push and it splits the space better.
+
+### Fixes worth making regardless of the outcome
+
+1. **Instrument the first megabyte.** The progress line only prints every 1 MB,
+   so the whole failure window — 0 to 0.06 MB — is a blind spot, and both
+   attempts landed in it. Print at the start of the payload phase and every
+   64 KB for the first MB. Without this the next run tells us as little as this
+   one did.
+2. **Make the blank check incremental.** Invalidate and check one 256 KB block
+   at a time inside the erase loop rather than the whole span at the end. That
+   turns one 1.78-million-operation cache call into 217 small ones, keeps the
+   console alive through it, and would make a hang inside it land on a
+   printable boundary. It is a better shape whether or not it is the bug.
+3. **Revert `CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE=16384`.** Measured worse; the
+   reasoning behind it was wrong.
+4. Consider `CONFIG_HW_STACK_PROTECTION=y` for the next debug build. It costs an
+   MPU region and turns a silent stack overflow into a printed fault, which is
+   exactly the diagnostic this failure has been denying us.
+
+### All four implemented, 2026-08-09
+
+Built clean, both configurations. Details where they differ from the proposal:
+
+**1. First-megabyte instrumentation — went finer than 64 KB, deliberately.**
+The observed death was at **0.06 MB ≈ 62 KB, which is below a 64 KB mark**, so
+64 KB granularity alone would still have printed nothing for either failure and
+bought us another blind run. The payload phase now reports:
+
+- one line when the payload phase begins, naming the flash address, the byte
+  count and the buffer count — this alone separates "died in the erase
+  aftermath" from "died in the payload phase", which the silent gap between
+  `OK erased` and the 1 MB mark did not;
+- **every buffer for the first 128 KB** (16 lines);
+- every 64 KB to 1 MB, then every 1 MB as before;
+- one line from the writer thread the first time `flash_write()` returns.
+
+That last line is the one to look for. It splits "died before any payload write
+completed" from "died after at least one did", and no evidence collected so far
+answers that question.
+
+**2. Blank check is now per 256 KB block, inside the erase loop.** One
+`sys_cache_data_invd_range()` of 1.78 million line operations and 14.2 million
+reads becomes 217 calls of 8192 and 65536, each between two printable points.
+It also localises a bad block to the erase that produced it, so
+`ERASE INCOMPLETE` now names the block address as well as the word.
+
+**3. `CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE=16384` reverted**, with the reasoning
+and the measurement that killed it left in `prj.conf` so nobody re-derives it.
+The end-of-payload drain it was aimed at is a host-side timeout question,
+answered with `--rx-timeout 120 --commit-timeout 300`.
+
+**4. `CONFIG_HW_STACK_PROTECTION=y`, in the default build, not a debug-only
+one.** The open bug is a silent lockup with no fault output, and a stack
+overflow is one of the few faults that stays silent without this. It is also
+cheaper here than the usual quote: on this Armv8-M core Zephyr satisfies it
+with `CONFIG_BUILTIN_STACK_GUARD` — the PSPLIM hardware stack limit register —
+**not** `CONFIG_MPU_STACK_GUARD`, so it costs a register write per context
+switch and no MPU region. Checked in the generated `.config` rather than
+assumed. Expect it to be able to turn an apparently-working board into one that
+faults at boot; that would be a real overflow that was previously corrupting
+memory quietly, not a regression.
+
+### Documented risk: the erase timeout margin is under 2x
+
+`TIME_ERASE_256K` in `flash_renesas_ra_ospi_b.h` is 16000, and
+`flash_renesas_ra_ospi_b_wait_operation()` spends at least one 100 us tick per
+iteration (`k_sleep(K_USEC(50))` at `CONFIG_SYS_CLOCK_TICKS_PER_SEC=10000`), so
+the budget for one 256 KB erase is about **1.6 s**. Measured on this board:
+**899 ms** per block (3m15s for 217 blocks).
+
+That is a margin of 1.8x on a part whose erase time rises with temperature and
+with program/erase cycles. It is not the cause of the 54 MB hang — the erase
+completed — but when it does bite it will present as an intermittent
+`pusher: erase failed at 0x...` partway through a long erase, on one block, and
+it will look like a flash fault rather than a timeout. A 55 MB rootfs erase
+rolls this dice 217 times per push.
+
+Nothing to fix in this application: the constant is the driver's, and raising
+it is a fork patch to `flash_renesas_ra_ospi_b.h` alongside the
+`PAGE_SIZE_BYTE=64` one (mikeysklar/zephyr#11).
+
+### Build after all four
+
+Against the tree's current baseline, which now also carries the guest NIC
+(189,948 B flash / 118,400 B RAM):
+
+| | flash | RAM |
+|---|---:|---:|
+| before these four changes | 189,948 | 118,400 |
+| **after** | **190,396** | **118,400** |
+| delta | **+448** | **0** |
+
+`arm-none-eabi-size`: 184,964 text / 5,504 data / 111,107 bss.
+`-DCONFIG_NETWORKING=n` still builds: 93,064 / 2,060 / 23,010. No new warnings
+in either.
+
+### Test 1, ready to run
+
+A ~10 MB push to the **rootfs** slot: same slot, same start address 0x841000,
+same write path, but a 40-block/~35 s erase instead of 217 blocks/3m15s.
+
+```sh
+python3 ra8d1-linux/rvlinux/tools/pushimage.py <10MB-file> \
+    --slot rootfs --tcp 192.168.2.3 \
+    --rx-timeout 120 --commit-timeout 300 --retries 1
+```
+
+`--retries 1` on purpose: this is a measurement, not an attempt to land an
+image, and a retry would muddy which attempt produced which console output.
+
+Read the console, not the tool. The lines that decide it, in order:
+`payload starts at flash 0x841000` → `8 KB` → `first flash_write returned` →
+`16 KB` … Whichever of those is last is the answer.
+
+- Survives → erase length (or the blank check that scaled with it) is the
+  variable; slot address and write path are exonerated. Run test 2.
+- Dies → the rootfs slot address is the variable, not the size.
+- Dies **before** `first flash_write returned` → nothing to do with the write
+  path at all, and the erase aftermath is the whole story.

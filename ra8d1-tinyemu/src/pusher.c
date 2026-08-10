@@ -475,7 +475,10 @@ static int img_erase(int slot, uint32_t len)
 	uint32_t off = plat_slot_offset(slot, NULL);
 	uint32_t esz = plat_flash_erase_size();
 	uint32_t need = ROUND_UP(len + IMG_PAYLOAD_OFF, esz);
+	size_t slot_size;
+	const uint8_t *base = plat_slot_base(slot, &slot_size);
 	uint32_t dots = 0;
+	uint32_t check_ms = 0;
 
 	if (!device_is_ready(nor)) {
 		us("pusher: NOR not ready\r\n");
@@ -489,59 +492,75 @@ static int img_erase(int slot, uint32_t len)
 			us("\r\n");
 			return -1;
 		}
-		/* One dot per 256 KB block, ~814 ms of it on this part, and a
-		 * newline every 16 MB so a full rootfs erase does not become
-		 * one 200-character line. */
+
+		/* Blank-check this block, now, before erasing the next one.
+		 *
+		 * The erase path reports success on a status bit and nothing
+		 * verifies that the bits actually went to 1. That gap matters
+		 * because a NOR program can only clear bits: programming over a
+		 * block that erased incompletely yields the bitwise AND of old
+		 * and new, which is data that is present, reads back identically
+		 * every time, and is wrong. After the fact that is
+		 * indistinguishable from a bad write. Checking before a single
+		 * payload byte is written separates them completely.
+		 *
+		 * Per block rather than in one pass at the end, changed
+		 * 2026-08-09. One pass over a 54 MB rootfs slot meant a single
+		 * sys_cache_data_invd_range() of 1.78 million cache-line
+		 * operations and 14.2 million reads with nothing on the console
+		 * throughout - and a 54 MB push is the one that takes the board
+		 * down with no output. Per block it is 8192 line operations and
+		 * 65536 reads between two printable points, so a hang inside it
+		 * now lands on a block boundary this loop has already named.
+		 * It also localises a bad block to the erase that produced it
+		 * rather than to the whole span.
+		 */
+		if (IS_ENABLED(CONFIG_RVT_PUSHER_BLANK_CHECK)) {
+			const uint32_t *p = (const uint32_t *)(base + e);
+			int64_t t0 = k_uptime_get();
+			uint32_t bad = 0, first_bad = UINT32_MAX;
+
+			sys_cache_data_invd_range((void *)p, esz);
+
+			for (uint32_t w = 0; w < esz / 4; w++) {
+				if (p[w] != 0xFFFFFFFFU) {
+					bad++;
+					if (first_bad == UINT32_MAX) {
+						first_bad = w * 4;
+					}
+				}
+			}
+
+			if (bad != 0) {
+				us("\r\npusher: ERASE INCOMPLETE at block ");
+				uhex(off + e);
+				us(" -- ");
+				udec(bad);
+				us(" of ");
+				udec(esz / 4);
+				us(" words not 0xFFFFFFFF, first at flash ");
+				uhex(off + e + first_bad);
+				us("\r\n");
+				return -1;
+			}
+			check_ms += (uint32_t)(k_uptime_get() - t0);
+		}
+
+		/* One dot per 256 KB block, ~899 ms of it measured on this part,
+		 * and a newline every 16 MB so a full rootfs erase does not
+		 * become one 200-character line. */
 		up('.');
 		if (++dots % 64 == 0) {
 			us("\r\n");
 		}
 	}
 
-	/* Blank-check what was just erased.
-	 *
-	 * The erase path reports success on a status bit and nothing verifies
-	 * that the bits actually went to 1. That gap matters because a NOR
-	 * program can only clear bits: programming over a block that erased
-	 * incompletely yields the bitwise AND of old and new, which is data
-	 * that is present, reads back identically every time, and is wrong.
-	 * After the fact that is indistinguishable from a bad write. Checking
-	 * here, before a single payload byte is written, separates them
-	 * completely, and costs one read pass over the erased region. */
 	if (IS_ENABLED(CONFIG_RVT_PUSHER_BLANK_CHECK)) {
-		size_t slot_size;
-		const uint32_t *p = (const uint32_t *)plat_slot_base(slot,
-								     &slot_size);
-		int64_t t0 = k_uptime_get();
-		uint32_t bad = 0, first_bad = UINT32_MAX;
-
-		sys_cache_data_invd_range((void *)p, need);
-
-		for (uint32_t w = 0; w < need / 4; w++) {
-			if (p[w] != 0xFFFFFFFFU) {
-				bad++;
-				if (first_bad == UINT32_MAX) {
-					first_bad = w * 4;
-				}
-			}
-		}
-
-		if (bad != 0) {
-			us("\r\npusher: ERASE INCOMPLETE -- ");
-			udec(bad);
-			us(" of ");
-			udec(need / 4);
-			us(" words not 0xFFFFFFFF, first at slot+");
-			uhex(first_bad);
-			us(" = flash ");
-			uhex(off + first_bad);
-			us("\r\n");
-			return -1;
-		}
-
-		us("\r\npusher: blank check ok in ");
-		udec((uint32_t)(k_uptime_get() - t0));
-		us(" ms\r\n");
+		us("\r\npusher: blank check ok, ");
+		udec(check_ms);
+		us(" ms over ");
+		udec(dots);
+		us(" blocks\r\n");
 	}
 
 	return 0;
@@ -660,6 +679,12 @@ static volatile uint32_t nl_wfail_off;   /* flash offset it failed at */
 static volatile uint32_t nl_wr_off;      /* offset currently being written */
 static volatile bool nl_wr_busy;         /* inside flash_write() right now */
 
+/* Cleared at the start of every push; set by the writer the first time
+ * flash_write() returns. One line, and it is the line that splits "died before
+ * any payload write completed" from "died after at least one did" - which is
+ * precisely the question the 54 MB failure could not answer. */
+static volatile bool nl_first_done;
+
 /* Set if a writer thread ever had to be abandoned. Its k_thread object and
  * stack are then permanently unsafe to reuse. */
 static bool nl_writer_lost;
@@ -702,6 +727,10 @@ static void nl_writer(void *a, void *b, void *c)
 			nl_wrc = -EIO;
 		}
 		nl_wr_busy = false;
+		if (!nl_first_done) {
+			nl_first_done = true;
+			us("pusher: first flash_write returned\r\n");
+		}
 		k_sem_give(&nl_free);
 	}
 }
@@ -967,11 +996,24 @@ static int nl_push(int s)
 	k_sem_init(&nl_filled, 0, 2);
 	nl_wrc = 0;
 	nl_wfail_off = 0;
+	nl_first_done = false;
 
 	k_thread_create(&nl_wtcb, nl_wstack, K_THREAD_STACK_SIZEOF(nl_wstack),
 			nl_writer, NULL, NULL, NULL,
 			CONFIG_RVT_PUSHER_WRITER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&nl_wtcb, "imgwrite");
+
+	/* The last line before the payload phase, and the first thing to look
+	 * for when a push dies early: it proves the erase, the blank check and
+	 * the writer thread creation are all behind us, which the previous
+	 * silent gap between "OK erased" and the 1 MB mark did not. */
+	us("pusher: payload starts at flash ");
+	uhex(slot_off + IMG_PAYLOAD_OFF);
+	us(", ");
+	udec(len);
+	us(" bytes in ");
+	udec((len + CONFIG_RVT_PUSHER_BUF - 1) / CONFIG_RVT_PUSHER_BUF);
+	us(" buffers\r\n");
 
 	t_rx = k_uptime_get();
 
@@ -1065,14 +1107,35 @@ static int nl_push(int s)
 		off += have;
 		i ^= 1;
 
-		/* A mark every 1 MB, on the UART rather than the socket. If a
-		 * push stalls, the last one printed says how far it got and at
-		 * what flash address. 1 MB not 4: the first stall seen on
-		 * rvlinux happened at 2.38 MB and fell between two 4 MB marks. */
-		if ((off & ((1U << 20) - 1)) < CONFIG_RVT_PUSHER_BUF) {
+		/*
+		 * Progress, on the UART rather than the socket, at three
+		 * granularities. If a push stalls, the last mark printed says
+		 * how far it got and at what flash address.
+		 *
+		 * The first 128 KB is reported per buffer. That is not
+		 * excessive: BOTH 54 MB failures died at or before 0.06 MB -
+		 * about seven buffers - and the old code's first mark was at
+		 * 1 MB, so the console said nothing at all about either of them.
+		 * A 64 KB granularity would still have missed a death at 62 KB.
+		 * The blind spot was the whole finding, so it is closed with
+		 * room to spare rather than exactly.
+		 *
+		 * 1 MB rather than 4 for the long run: the first stall seen on
+		 * rvlinux was at 2.38 MB and fell between two 4 MB marks.
+		 */
+		if (off <= (128U << 10) ||
+		    (off < (1U << 20) && (off & ((64U << 10) - 1)) <
+					 CONFIG_RVT_PUSHER_BUF) ||
+		    (off & ((1U << 20) - 1)) < CONFIG_RVT_PUSHER_BUF) {
 			us("pusher: ");
-			udec(off >> 20);
-			us(" MB at flash ");
+			if (off < (1U << 20)) {
+				udec(off >> 10);
+				us(" KB");
+			} else {
+				udec(off >> 20);
+				us(" MB");
+			}
+			us(" at flash ");
 			uhex(slot_off + IMG_PAYLOAD_OFF + off);
 			us("\r\n");
 		}

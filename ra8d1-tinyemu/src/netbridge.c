@@ -108,6 +108,25 @@ void plat_net_send(const uint8_t *frame, uint32_t len)
 		nb.tx_dropped++;
 		return;
 	}
+
+	/*
+	 * Rewind before queueing. This is not housekeeping, it is the whole
+	 * frame: net_pkt_write() leaves the cursor at the end of what it
+	 * wrote, and the driver's tx does net_pkt_read() FROM THE CURSOR. The
+	 * normal ethernet_send() path calls net_pkt_cursor_init() for you -
+	 * but it does so on the line before the `send:` label, and the raw
+	 * AF_PACKET path arrives by `goto send`, jumping over it
+	 * (ethernet.c:735-742 vs 769-772). So a raw sender has to do it
+	 * itself.
+	 *
+	 * Cost of omitting it, measured on hardware: every frame queues and
+	 * transmits nothing. The guest's own tx_packets counter still climbs -
+	 * it counts what it handed the virtio device - so the guest looks
+	 * healthy while the wire stays silent, and the Mac's ARP entry for it
+	 * sits at "(incomplete)" forever.
+	 */
+	net_pkt_cursor_init(pkt);
+
 	/* Returns void; a full TX queue surfaces as the driver's own
 	 * backpressure (the cherry-picked K_MSEC wait), not here. */
 	net_if_queue_tx(iface, pkt);
