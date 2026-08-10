@@ -53,7 +53,7 @@ Docker container.
 | What | Where | Revision used |
 |---|---|---|
 | Zephyr (fork) | `git@github.com:mikeysklar/zephyr.git` | branch `ra8d1/glcdc-64byte-alignment`, `1f6f2c3b4d7`, v4.4.99 |
-| CircuitPython (fork, carries the west workspace) | `git@github.com:mikeysklar/circuitpython.git` | branch `ra8d1/integration` |
+| West-workspace host (a CircuitPython fork, used here purely as the pinned Zephyr build environment) | `git@github.com:mikeysklar/circuitpython.git` | branch `ra8d1/integration` |
 | West workspace root | `circuitpython/ports/zephyr-cp/` | manifest at `zephyr-config/west.yml` |
 | Buildroot (guest) | `https://gitlab.com/buildroot.org/buildroot.git` | `--depth 1` is fine |
 | TinyEMU (emulator core) | `https://bellard.org/tinyemu/tinyemu-2019-12-21.tar.gz` | MIT |

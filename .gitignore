@@ -48,3 +48,12 @@ __pycache__/
 .cache/
 .DS_Store
 compile_commands.json
+
+# Not part of the Linux port story this repo tells. These exist in the local
+# working tree (the Z80 arcade experiment, the CircuitPython bring-up pack and
+# its runbook, the Slack coordination doc) but the repo is the record of
+# bringing up Linux + Blinka on this board, and they are neither.
+ra8d1-arcade/
+ra8d1-pack/
+ra8d1-cli.md
+SLACK.md
