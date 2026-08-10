@@ -1226,3 +1226,149 @@ Start at the window-update question, not at the beginning.
    It is two lines and it moves the system off the edge the bug lives on.
 5. `PAGE_SIZE_BYTE` (#11) still shortens every exposure by 4-8x and remains the
    highest-value single fix in this whole file.
+
+---
+
+## 2026-08-09, runs G and H: the first complete payload, and the historical fault caught in the open
+
+### Run G: window fix live, a new failure mode
+
+`NET_BUF_RX_COUNT=256`, window 10922 B, verified in autoconf. Erase 3m23s,
+blank check clean. Died at **475,136** — 58 buffers, 464 KB — with a bare
+`rx error`, and **`BUFFER STALLED` never fired**.
+
+That silence is the instrument working, not failing. `BUFFER STALLED` only
+fires when a buffer takes over 60 s to fill; a hard `rx error` inside 60 s of
+healthy flow means `zsock_poll()` or `zsock_recv()` failed at the stack level.
+**This is not the trickle deadlock.** It is a different mode, at an offset well
+below the old 5-7 MB band, and its identity is unknown because the bare print
+predates the errno patch. The errno instrument is armed for the next one.
+
+One data point. Do not build a theory on it yet.
+
+### Run H: 54 MB of payload, clean, first time ever
+
+```
+payload sent in 6m41s (137.8 KB/s into the socket)
+pusher: 56623104 bytes in 402291 ms
+```
+
+**The entire payload streamed and was written without a transport failure.** No
+stall, no trickle, no early death. That has not happened before in this app.
+
+#### Scoring the window fix honestly: n=1 clean of 2, and do not credit it with the speed
+
+What the window fix can be credited with: the trickle-deadlock signature —
+silent board, `off` frozen, host parked in `sendall` — **did not recur in either
+run**, and `BUFFER STALLED`, built specifically to catch it, never fired.
+
+What it must **not** be credited with: the 1.94x throughput. 71 KB/s → 137.8
+KB/s looks like a window effect and is almost certainly the WIP polling floor
+(fork `122c70fe591`), which landed in the same builds. **Two variables moved
+together, so the throughput number cannot be attributed to either.** If the
+attribution matters, one build with the floor and the old window settles it;
+nothing downstream depends on knowing.
+
+Run G is the honest asterisk: one clean payload out of two attempts on this
+build. Possibly residual probabilistic failure, possibly a distinct bug.
+
+### The verify failure is the historical fault, and three instruments cornered it
+
+```
+block diff: 1 of 864 64 KB blocks differ -- block 125 at payload 0x7d0000
+DIAG: 0 of 864 blocks read differently on a second pass
+DIAG: 0 of 864 64K blocks still erased (0xFF)
+DIAG: readback crc pass1=0x0d0e93ba pass2=0x0d0e93ba stable
+pusher: blank check ok, 952 ms over 217 blocks
+```
+
+BUILD.md has carried this fault since before this port: "the board writes the
+full payload, reads it back, and the CRC sometimes disagrees", with two live
+hypotheses — an OSPI read/write timing margin, or an incomplete erase. **Both
+of those are now eliminated, and for the first time the evidence does it
+positively rather than by argument:**
+
+| instrument | result | eliminates |
+|---|---|---|
+| blank check, per 256 KB block after erase | all 217 blocks verified 0xFF | **incomplete erase** |
+| DIAG two-pass CRC with cache invalidate | 0 of 864 blocks differ, pass1 == pass2 | **stale read / OSPI prefetch** |
+| DIAG erased-block scan | 0 of 864 still 0xFF | **a block that was never programmed** |
+| host block diff | 863 of 864 byte-correct | **transport corruption** |
+
+By elimination the program operation for that one block wrote the wrong data
+and the flash has held it faithfully ever since. **Written, stable, wrong** —
+and now with the erase and the read path ruled out underneath it.
+
+That is what the blank check and the two-pass DIAG were added for, and it is
+the first time they have had the chance to do it.
+
+#### One precision point: "scattered" is over-reading a single block
+
+`pushimage.py` printed `shape: scattered -- individual flash operations failing
+independently`. That verdict comes from `len(runs) > len(bad) // 2`, which for
+one bad block is `1 > 0` — **trivially true for any single failure.** With n=1
+you cannot distinguish scattered from isolated, and the tool's own third
+category is the right reading: "a single bad block in an otherwise perfect image
+is something else again."
+
+Geometry, which also argues against an erase-side effect:
+
+- block 125 spans payload 0x7d0000-0x7e0000 = **buffers 1000-1007** of 6912
+- flash address 0x1011000
+- that sits **25.6% into erase block 31** of 217 — nowhere near an erase-block
+  boundary, so this is not an edge-of-erase artefact
+
+**The discriminator is free and already running.** Run I retries the same image:
+
+- fails again at **block 125 / flash 0x1011000** → a physical defect or marginal
+  cell at that address, and the fix is a bad-block skip or simply a different
+  slot offset
+- fails at a **different** block → a transient program fault, and the address
+  carries no information
+- **passes** → intermittent at roughly the historical rate, and `--retries 3`
+  remains the answer
+
+No new code is needed to learn that, which is why it beats any instrument that
+could be added now.
+
+### Open questions, ranked
+
+**1. The residual single-block program fault.** The WIP floor is in place, so
+"the next program started before the last one finished" is less likely — but a
+floor is a floor, not a proof. `flash_renesas_ra_ospi_b_wait_operation()`
+returns as soon as `R_OSPI_B_StatusGet()` reports `write_in_progress` clear, and
+that status read is itself a `DirectTransfer` that takes the controller out of
+memory-mapped mode. A status read that returns a stale or mis-sampled bit lets
+the next program start early, with the WIP floor unable to see it. Suspects, in
+order:
+
+  - status-read / mode-switch interaction letting a program start early
+  - a marginal cell, i.e. Semper ECC correcting-then-failing at one address —
+    **repeatable at the same address, which run I tests for free**
+  - the FSP combination-write path racing something at 64-byte page granularity
+
+A 64 KB block is 1024 page programs at `PAGE_SIZE_BYTE=64`. One of 1024 went
+wrong; localising further than 64 KB needs finer CRCs than the protocol carries,
+and changing the protocol means changing `pushimage.py`, which is the one
+component known to work. **Prefer the retry experiment over new instrumentation
+here.**
+
+**2. Run G's hard `rx error` at 464 KB.** Unidentified. The errno is now in the
+report, so the next occurrence names itself. Until then it is one data point and
+should not be merged with the trickle story — `BUFFER STALLED` staying silent is
+positive evidence that it is a different mechanism.
+
+### Practical state
+
+**`--retries 3` is the operating procedure**, and it always was the design
+assumption — the retry loop exists because this fault is intermittent rather
+than deterministic. A retry re-erases the slot before re-sending, which is also
+exactly what the Semper ECC rule requires: nothing is ever re-programmed in
+place.
+
+A 54 MB push is now ~3m30s of erase plus ~6m40s of payload, about 10-11 minutes
+per attempt. Budget three attempts.
+
+`PAGE_SIZE_BYTE` (#11) remains the highest-value single fix in this file: at 64
+against a 256- or 512-byte page buffer it is still costing 4-8x on every write,
+and every minute it adds is a minute of exposure to everything above.
