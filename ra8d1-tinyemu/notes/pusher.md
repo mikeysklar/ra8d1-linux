@@ -314,3 +314,77 @@ and the SDRAM re-initialised, and the deferred reboot's interaction with a real
 6. **Do not overwrite a known-good slot to test this** (gotcha 18). Push a small
    throwaway kernel first, confirm the halt, the reboot and the boot, and only
    then push anything you would mind losing.
+
+---
+
+## 2026-08-09: first hardware contact. Kernel works, 54 MB rootfs does not.
+
+Two results, and the second one is the interesting one.
+
+### Kernel push: works, end to end
+
+`Image-virtionet`, 6,577,272 B into the kernel slot:
+
+```
+erasing 26 blocks (~21s modelled)   erase took 21s
+payload sent in 34s (189.0 KB/s into the socket)
+done in 1m52s (modelled 1m45s)      measured end-to-end 57.3 KB/s
+```
+
+Verified by the thing that matters: the board rebooted and the banner read
+`kernel: 6577272 B, crc ok in 108 ms`, and that kernel is what is running now.
+So the protocol, the halt, the erase, the write, the CRC and the container are
+all correct on silicon, and `pushimage.py` drove it unmodified. **The
+flash-rvlinux-push-flash-back dance is genuinely gone for kernel-sized images.**
+
+That first kernel push needed widened timeouts (`--rx-timeout 120
+--commit-timeout 300`). With defaults it failed at 99.6% — the tool finished
+sending 3 MB ahead of the flash writer and timed out during the silent drain,
+twice, identically (`rx error at payload offset 6561792 of 6577272`).
+
+### The 16 KB receive window was the wrong fix
+
+Reasoning at the time: rvlinux kept the sender blocked at the socket, so
+`pushimage.py`'s timeout model assumes the wire paces itself; a big window
+breaks that assumption. So cap it — `CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE=16384`
+— and the sender's rate converges on the writer's.
+
+**Measured: it made things worse.** With the cap, a 54 MB rootfs push stalled
+at 0.06 MB (0.1%) instead of 99.6%, and attempts 2 and 3 never got a banner.
+The hypothesis was at best incomplete and is not the explanation.
+
+### The failure that matters: a 54 MB push takes the whole board down
+
+The erase completed (217 blocks, 3m15s, modelled 2m57s). Payload started.
+Then the board went **completely unreachable — no ping, no port 5555, silent
+UART.** Not a stalled transfer: the application itself stopped.
+
+It recovers cleanly on `probe-rs reset`, and the kernel slot survived intact,
+so nothing is damaged. But this is a hard failure with a real fault behind it,
+and it is NOT the historical intermittent verify miss.
+
+What was ruled out, so nobody re-runs it:
+
+| suspect | why it is not that |
+|---|---|
+| flash writer starving the network | writer is priority 8, below eth RX (2), TCP worker (2) and telnet (5) |
+| the ECC-unit rule | the code never violated it; asserts and padding are guards, not fixes |
+| the tool's timeouts | the board is unreachable, not slow — timeouts cannot cause that |
+| image or slot geometry | identical image pushed fine through rvlinux minutes later |
+
+Where to look next, in order: whether the RA OSPI-B driver spins with
+interrupts masked for the duration of a program (12 minutes of near-continuous
+programming is a very different duty cycle from a 26-block kernel, and it is
+the one variable that scales with image size); whether the memory-mapped OSPI
+window is disabled during programming while something still holds a pointer
+into it (`plat_slot_base()` hands one to the machine layer, and the machine is
+halted — but `img->rootfs` is still a live pointer in a struct); and the
+watchdog, if one is enabled by default.
+
+### Current honest scope
+
+- **Kernel-sized images: use this pusher.** Proven on hardware.
+- **54 MB rootfs: use the rvlinux path** (flash rvlinux, push, flash back).
+  It did the same image in 14m21s the same day, before and after this attempt.
+
+That is a smaller win than "gotcha 14 is dead", and it is the win that exists.
