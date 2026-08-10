@@ -1072,19 +1072,64 @@ static int nl_push(int s)
 		 * land in large aligned runs instead of TCP-segment-sized
 		 * dribbles, which matters when each one costs a program-and-poll
 		 * cycle per 64 bytes. */
+		/*
+		 * Fill one buffer, under a deadline for the WHOLE buffer.
+		 *
+		 * The per-recv timeout is not enough and that gap is why four
+		 * runs died invisibly. nl_recv() gives each call a fresh 30 s
+		 * poll, but this loop had no overall bound - so a sender
+		 * delivering ANY bytes more often than every 30 s keeps it
+		 * alive forever while `off` never advances, no progress line
+		 * prints, and neither the 15 s writer stall nor the 30 s rx
+		 * timeout can fire. Every failure so far has that exact
+		 * signature: board consumed all sent bytes, host blocked in
+		 * sendall for ten minutes, board silent throughout.
+		 *
+		 * A TCP zero-window persist probe carries one byte and repeats
+		 * every 5 to 60 s, which fits the signature precisely. The
+		 * counters below are what will settle it: bytes actually
+		 * received, and how many recv calls it took. One byte per call
+		 * is a persist probe and nothing else.
+		 */
 		want = MIN((uint32_t)CONFIG_RVT_PUSHER_BUF, len - off);
-		while (have < want) {
-			int got = nl_recv(s, (uint8_t *)nl_buf[i] + have,
-					  want - have,
-					  CONFIG_RVT_PUSHER_RX_TIMEOUT_S);
+		{
+			int64_t bstart = k_uptime_get();
+			uint32_t calls = 0;
 
-			if (got <= 0) {
-				us(got == 0 ? "pusher: rx timeout\r\n"
-					    : "pusher: rx error\r\n");
-				failed = true;
-				break;
+			while (have < want) {
+				int got = nl_recv(s, (uint8_t *)nl_buf[i] + have,
+						  want - have,
+						  CONFIG_RVT_PUSHER_RX_TIMEOUT_S);
+
+				if (got <= 0) {
+					us(got == 0 ? "pusher: rx timeout\r\n"
+						    : "pusher: rx error\r\n");
+					failed = true;
+					break;
+				}
+				have += (uint32_t)got;
+				calls++;
+
+				if (k_uptime_get() - bstart >
+				    CONFIG_RVT_PUSHER_BUFFER_MS) {
+					us("pusher: BUFFER STALLED -- ");
+					udec(have);
+					us(" of ");
+					udec(want);
+					us(" bytes in ");
+					udec((uint32_t)(k_uptime_get() - bstart));
+					us(" ms over ");
+					udec(calls);
+					us(" recv calls (");
+					udec(have / calls);
+					us(" bytes each). One byte each is a "
+					   "zero-window persist probe: the "
+					   "sender is blocked and our window "
+					   "never reopened\r\n");
+					failed = true;
+					break;
+				}
 			}
-			have += (uint32_t)got;
 		}
 		if (failed) {
 			break;

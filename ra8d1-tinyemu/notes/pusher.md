@@ -930,3 +930,299 @@ the stack guard is now armed to name it.
 
 `arm-none-eabi-size`: 185,312 text / 5,504 data / 111,107 bss. Clean, no
 warnings.
+
+### The config comparison, done properly: generated .config, not prj.conf
+
+`ra8d1-linux/rvlinux/build/zephyr/.config` against
+`ra8d1-tinyemu/build-pusher/zephyr/.config`, every `CONFIG_NET_*` symbol.
+**The complete networking delta is five symbols, and all five are the guest
+NIC's:**
+
+```
+> CONFIG_NET_PROMISCUOUS_MODE=y
+> CONFIG_NET_PROMISC_LOG_LEVEL=0
+> CONFIG_NET_SOCKETS_PACKET=y
+> CONFIG_NET_SOCKETS_PACKET_DGRAM=y
+> CONFIG_NET_CONNECTION_SOCKETS=y
+> CONFIG_NET_L2_ETHERNET_MGMT=y
+> CONFIG_NET_ETHERNET_FORWARD_UNRECOGNISED_ETHERTYPE=y
+```
+
+**Not one TCP, pool, buffer or window symbol differs.** Every
+`CONFIG_NET_TCP_*`, `NET_PKT_*`, `NET_BUF_*`, `NET_MAX_*` value is identical
+between the app that moves 54 MB and the app that dies at 6.
+
+#### Keepalive is definitively not it
+
+It was a good shape to suspect — an unprovoked RST during sustained zero-window
+is exactly what a misfiring keepalive looks like — but it is identical on both
+sides, three ways:
+
+| | rvlinux | tinyemu |
+|---|---|---|
+| `CONFIG_NET_TCP_KEEPALIVE` | y | y |
+| `KEEPIDLE_DEFAULT` / `KEEPINTVL` / `KEEPCNT` | 7200 / 75 / 9 | 7200 / 75 / 9 |
+| app sets `SO_KEEPALIVE` on the push socket | yes | yes |
+
+`keep_alive_timer_init()` also starts each connection with
+`conn->keep_alive = false` until `SO_KEEPALIVE` sets it, and the idle timer is
+**7200 seconds** — two hours. It cannot fire inside a 16 minute push.
+
+### What tcp.c actually does about zero windows
+
+Read of `subsys/net/ip/tcp.c` in this tree:
+
+- `tcp_send_zwp()` / `conn->persist_timer` is the **sender-side** zero-window
+  probe: it runs when the *peer's* window is zero and we have data to send. On
+  a push the board is the receiver, so this path belongs to macOS, not to us.
+- `conn->zwp_retries` saturates at 63 and only stretches the probe backoff. It
+  never closes a connection. There is no receive-side probe counter that gives
+  up.
+- The only places tcp.c aborts a connection of its own accord are keepalive
+  exhaustion (`keep_cur > keep_cnt` → `-ETIMEDOUT`, ruled out above), the
+  SO_LINGER timeout (`CONFIG_NET_CONTEXT_LINGER` **is not set** in this build),
+  and retransmission exhaustion (`CONFIG_NET_TCP_RETRY_COUNT=9`).
+
+**So the reachable mechanism is retransmission exhaustion**, which is what
+sustained frame loss produces — and frame loss is what an RX pool under the
+promiscuous clone's pressure produces. No counter in tcp.c fires at a fixed
+byte count, which agrees with the 15% spread between the two observed deaths:
+this is loss and retry, not a limit being hit.
+
+Note also that the board's RST is our own `zsock_close()` on a socket with
+unread data queued, after `nl_recv()` already returned -1. Zephyr failed the
+socket first; the RST is the tail of that, not an unprovoked abort.
+
+### The discriminating change, and what it should do
+
+**Suspend promiscuous mode when the guest halts** — implemented above. It is
+the cheapest discriminator available because it removes the *only* per-packet
+receive-path difference from the configuration that demonstrably moves 54 MB
+through this silicon. After the halt the board's RX path is byte-for-byte
+rvlinux's.
+
+Expected result if the diagnosis is right:
+
+| outcome | reading |
+|---|---|
+| push completes (~16 min) | confirmed; ship it |
+| dies **well past** the 5-7 MB band (>20 MB) | cloning was most of it, something else remains |
+| dies **again at 5-7 MB** | cloning is exonerated, and the promiscuous theory is dead rather than dented |
+
+That third row is the point of doing this one change alone. Ranked next levers,
+one at a time, in this order:
+
+1. `CONFIG_NET_BUF_RX_COUNT` 32 → 128 (~12 KB SRAM). Raises a 4 KB RX pool that
+   holds 2.6 full-size frames.
+2. `CONFIG_NET_BUF_DATA_SIZE` 128 → 512. A 1514 B frame costs 12 buffers at 128
+   and 3 at 512; fragmentation is half the reason the pool is tight.
+3. `CONFIG_NET_ETHERNET_FORWARD_UNRECOGNISED_ETHERTYPE=n` if it can be turned
+   off without breaking the bridge — it makes L2 pass frames up that it would
+   otherwise drop, which is more net_pkt churn on a shared segment.
+
+A receive-window cap is **not** on that list any more. It was tried, it
+measured worse, and the reason it looked worse is now understood: it removed
+the host-side buffering that was masking how slow the link really is.
+
+### Three things to keep from this episode
+
+**The real throughput fix is `PAGE_SIZE_BYTE`.** `flash_renesas_ra_ospi_b.h`
+hardcodes 64 against an S28HL512T page buffer of 256 or 512
+(mikeysklar/zephyr#11). That one constant is why a push runs at 71 KB/s and why
+54 MB is a 13-minute exposure to any network fault at all. Fixed, the same push
+is about 3 minutes, and every timeout, window and pool problem in this file gets
+4-8x less time to happen. It is worth more than anything else listed here.
+
+**The incremental blank check was worth doing on its own merits.** 965 ms over
+217 blocks (4.4 ms per 256 KB) against roughly 19 s for the single-pass version.
+The cost was never reading the flash; it was one
+`sys_cache_data_invd_range()` of 1.78 million cache-line operations. Erase went
+from 3m15s to 2m53s for identical work.
+
+**The wedge has not recurred.** Two full 54 MB attempts under
+`HW_STACK_PROTECTION=y` with the payload instrumentation, and the board stayed
+alive, printing and pingable through both, ending each with its own
+diagnostics. No stack-overflow fault printed either. That is two clean runs, not
+an explanation — nothing here accounts for the original no-ping/silent-UART
+lockup, and it should not be called fixed. The guard is armed to name it if it
+returns.
+
+---
+
+## 2026-08-09, run 5: the cloning hypothesis is refuted, and the real mechanism
+
+### Scoring my own hypothesis: wrong
+
+I predicted three outcomes for a promiscuous-suspended push: completes, dies
+well past 6 MB, or **"dies again at 5-7 MB → cloning is exonerated and the
+theory is dead rather than dented."** Run 5 died at **1,048,576** — not past the
+band, *below* it, six times lower, with cloning off and no guest running.
+
+**That refutes cloning as the mechanism.** Not weakened, refuted. The clone is
+still real waste and suspending it is still correct, but it is not what kills
+these pushes and it must not be described as a fix.
+
+The death-offset table is the argument:
+
+| offset | buffers | promiscuous | guest |
+|---:|---:|---|---|
+| 6,848,512 | 836 | on | running |
+| 5,980,160 | 730 | on | running |
+| 1,048,576 | 128 | **off** | **none** |
+
+A 6.5x spread with the suspected cause removed. This was never a counter or a
+pool running out at a fixed point.
+
+### (a) No, there is no 7-bit or 1 MB state in the pusher
+
+Rechecked against the instrumented version specifically. The producer's entire
+per-iteration state is `i ^= 1`, `have`, `want`, and `off`; the erase loop's is
+`dots`. All `uint32_t`, none masked to 7 bits. The print condition is
+
+```c
+off <= (128U << 10) ||
+(off < (1U << 20) && (off & ((64U << 10) - 1)) < CONFIG_RVT_PUSHER_BUF) ||
+(off & ((1U << 20) - 1)) < CONFIG_RVT_PUSHER_BUF
+```
+
+which at `off == 1048576` takes the third arm, prints `1 MB`, and touches
+nothing else. The `1 MB` line **did** print, so iteration 128 completed in full
+— recv, handoff, `off += 8192`, print — and the failure is in iteration 129's
+receive. The print granularity changes at that offset because the transfer
+stopped there, not the other way round.
+
+128 buffers being 2^7 is coincidence. The other two deaths were at 836 and 730
+buffers, which are not powers of anything. All three are multiples of 8192
+because `off` only ever advances by a completed buffer.
+
+### (b) What the reader was blocked in — and it is a defect of mine
+
+Enumerating every wait, the answer is none of them. It was **not** blocked. It
+was looping.
+
+```c
+while (have < want) {
+        int got = nl_recv(s, buf + have, want - have, 30 /* seconds */);
+        ...
+        have += got;
+}
+```
+
+`nl_recv()` gives **each call** a fresh 30 s poll. The loop that fills a buffer
+had **no overall deadline**. So a sender delivering any bytes at all more often
+than every 30 seconds keeps this loop alive indefinitely:
+
+- `off` never advances → no progress line, at any granularity
+- the 15 s `nl_free` stall never fires → the writer has nothing pending
+- the 30 s poll never expires → it keeps being satisfied
+
+**That is the universal signature of all four failures, exactly.** Board
+consumed everything sent, host blocked in `sendall` for 600 s, board silent,
+neither timeout printed. The board was awake and spinning on a trickle the whole
+time.
+
+### (c) The trickle is a TCP zero-window persist probe, and the window is the bug
+
+macOS uses BSD persist timing: `TCPTV_PERSMIN` 5 s to `TCPTV_PERSMAX` 60 s with
+exponential backoff, each probe carrying **one byte**. Delivered to the app,
+that is one byte per `nl_recv()` — enough to reset a 30 s poll and never enough
+to fill an 8192-byte buffer. At one byte per probe a buffer takes eleven hours.
+
+Why the connection is in zero-window state essentially permanently:
+
+```c
+static int tcp_rx_window =
+#if (CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE != 0)
+        CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE;
+#else
+        (CONFIG_NET_BUF_RX_COUNT * CONFIG_NET_BUF_DATA_SIZE) / 3;
+```
+
+With this build's `NET_BUF_RX_COUNT=32` and `NET_BUF_DATA_SIZE=128`:
+
+**(32 x 128) / 3 = 1365 bytes. The board's entire TCP receive window is 1365
+bytes — 0.93 of one MSS.**
+
+The window cannot hold a single full-size segment. Every segment the host sends
+closes it completely, and every subsequent segment depends on a window-update
+ACK going out and arriving. A 54 MB push is roughly 40,000 of those round trips,
+and losing or suppressing **one** leaves the sender in persist mode forever:
+the app has already drained everything, so `tcp_update_recv_wnd()` — which is
+only called from `net_context.c:4263` when the application reads *more* data —
+is never called again, and no further window update is ever generated. The
+deadlock is self-sustaining.
+
+That is a per-round-trip lottery, which is why the death offsets scatter over
+6.5x instead of clustering on a count.
+
+**And it reframes the 16 KB experiment completely.** Setting
+`CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE=16384` did not *cap* anything — a nonzero
+value **replaces** the derived one, so it raised the window from 1365 to 16384,
+**four times the entire 4 KB RX buffer pool**. The board advertised four times
+the buffering it owned. That is why it measured worse, and the "cap" reading of
+that result was wrong in both direction and magnitude.
+
+### The fix to make next, and why it is two symbols not one
+
+The window is derived from the buffer pool, so the pool and the window have to
+move together:
+
+```
+CONFIG_NET_BUF_RX_COUNT=256      # 32 KB of RX buffer (was 4 KB)
+CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE=10922   # or leave 0 and let it derive
+```
+
+At `NET_BUF_RX_COUNT=256` the derived window is `(256*128)/3 = 10922` bytes =
+7.5 MSS, backed by a pool three times its size. Costs about 28 KB of SRAM, which
+this app has: RAM is at 12.9% of 896 KB.
+
+Intermediate points, if 28 KB is judged too much: 64 → 2730 B (1.9 MSS), 128 →
+5461 B (3.7 MSS). **Anything at or above 2 MSS gets the connection off the
+knife edge**, because the window can then hold a whole segment plus room to
+acknowledge it without going to zero every time.
+
+rvlinux runs the same 1365-byte window and pushes 54 MB successfully, so this
+is a probability, not a certainty — it lives on the same knife edge and gets
+lucky. That is consistent with everything seen: rvlinux's pushes are also
+described in this repo as intermittently failing.
+
+### Instrumented for the next run
+
+`CONFIG_RVT_PUSHER_BUFFER_MS` (default 60 s) bounds filling one buffer, not just
+one recv. On expiry it prints bytes received, elapsed, recv-call count and bytes
+per call:
+
+```
+pusher: BUFFER STALLED -- 37 of 8192 bytes in 60013 ms over 37 recv calls
+(1 bytes each). One byte each is a zero-window persist probe: the sender is
+blocked and our window never reopened
+```
+
+**One byte per call proves the persist-probe diagnosis outright.** Anything
+else — a few hundred bytes per call, or zero calls — refutes it and says look
+elsewhere. A healthy buffer arrives in ~115 ms, so 60 s is 500x headroom.
+
+Build: 191,376 B flash, 118,400 B RAM, clean.
+
+### For whoever picks this up tomorrow
+
+Start at the window-update question, not at the beginning.
+
+1. The board's receive window is **1365 bytes, below one MSS**, derived from
+   `NET_BUF_RX_COUNT * NET_BUF_DATA_SIZE / 3`. Everything else follows from
+   that.
+2. The next run's `BUFFER STALLED` line settles whether persist probes are the
+   trickle. Read that line first.
+3. If it is: the question is why Zephyr stops emitting window updates.
+   `tcp_update_recv_wnd()` is called on the receive path with a negative delta
+   (tcp.c:1342) and from the application read path (net_context.c:4263) with a
+   positive one; the emission condition is
+   `(short_win_before && !short_win_after) || tcp_need_window_update(conn)` at
+   tcp.c:1250. With `recv_win_max` 1365 and `conn_mss` 1460, look hard at
+   `tcp_need_window_update()`'s `MAX(conn_mss, recv_win_max/2)` threshold — it
+   is 1460, larger than the whole window, which makes that predicate behave in
+   ways its author did not have in mind.
+4. Raise the pool before spending another hardware window on anything subtle.
+   It is two lines and it moves the system off the edge the bug lives on.
+5. `PAGE_SIZE_BYTE` (#11) still shortens every exposure by 4-8x and remains the
+   highest-value single fix in this whole file.

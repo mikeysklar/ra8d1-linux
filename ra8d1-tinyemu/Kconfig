@@ -216,6 +216,26 @@ config RVT_PUSHER_VERIFY_ATTEMPTS
 config RVT_PUSHER_RX_TIMEOUT_S
 	int "Seconds a stalled transfer is tolerated before the push is dropped"
 	default 30
+	help
+	  Per recv() call. Not a bound on filling a whole buffer - see
+	  RVT_PUSHER_BUFFER_MS, which is the one that catches a trickle.
+
+config RVT_PUSHER_BUFFER_MS
+	int "Milliseconds allowed to fill one receive buffer before giving up"
+	default 60000
+	help
+	  RVT_PUSHER_RX_TIMEOUT_S bounds a single recv(); this bounds the whole
+	  buffer. Without it a sender delivering any bytes at all more often
+	  than the per-recv timeout keeps the fill loop alive indefinitely
+	  while the payload offset never advances - no progress line, no stall
+	  report, nothing on the console. Four 54 MB pushes died exactly that
+	  way before this existed.
+
+	  A healthy buffer arrives in about 115 ms at the measured 71 KB/s, so
+	  60 s is 500x headroom and only fires on a genuinely wedged transfer.
+	  The report names bytes received and recv calls taken: one byte per
+	  call is a TCP zero-window persist probe, which is the shape this was
+	  built to catch.
 
 config RVT_PUSHER_STALL_MS
 	int "Milliseconds to wait for the flash writer before declaring a stall"
