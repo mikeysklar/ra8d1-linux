@@ -99,6 +99,36 @@ changed code or plans, with the noise omitted:
   PulseIn paths via their existing `importing.py` pattern, not another
   platform_machine exclusion.
 
+## 2026-08-09: on silicon, host side up
+
+Implemented and flashed. The app banner now reads:
+
+```
+***  board ip 192.168.2.3   guest console:  telnet 192.168.2.3  ***
+guest NIC bridged to eth0 (promiscuous)
+```
+
+That second line is `net_promisc_mode_on()` returning 0 on real hardware,
+which is the whole point of the driver patch — before `8ca5eb88530` it could
+only return `-ENOTSUP`. Promiscuous mode is therefore **confirmed working on
+this silicon**, not just compiling.
+
+Sizes with everything on (telnet + pusher + guest NIC): 189,948 B flash
+(9.20% of 2016 KB), 118,400 B RAM (12.90%), SDRAM still 0 — the guest's 64 MB
+is untouched, as intended.
+
+Escape hatches verified by building all three: full, `CONFIG_NETWORKING=n`,
+and `CONFIG_RVT_GUEST_NET=n`. With the bridge off, `plat_net_mac()` returns
+false and the device is never created — no MMIO window, no FDT node, a guest
+bit-identical to one built before the NIC existed.
+
+Guest-side proof is still pending: the kernel with `CONFIG_VIRTIO_NET` is in
+the slot (pushed by the new in-app pusher, banner confirms
+`kernel: 6577272 B, crc ok`), but the SSH rootfs push is what puts a userland
+on the other end of the wire, and that ran into the pusher's 54 MB failure
+(see ../../ra8d1-tinyemu/notes/pusher.md). Being pushed via the rvlinux path
+instead. Nothing about that touches this project's code.
+
 ## Risks / open questions
 
 - Second MAC on the Mac Internet Sharing segment: §7.1 of the design says
